@@ -1,34 +1,20 @@
-import hashlib
-print("[VERSION] joint_exposure_demand_h3_v3 FINAL PREDICTION-ONLY EXPORT", flush=True)
-
-print("\n" + "#" * 96, flush=True)
-print("[VERSION] v2_2_12 GRAPH_DEEP_PROFILE_MEMORY_SAFE_LAZY_WORKERS ACTIVE", flush=True)
-print("[VERSION] Expected path: base load -> graph wrapper -> eager dataset -> single-process DataLoader", flush=True)
-print("#" * 96 + "\n", flush=True)
-print("[VERSION] v2_2_13 PREGRAPH_EXTERNAL_HAT_AND_GRAPH_BOUNDARY_PROFILE ACTIVE", flush=True)
-print("[VERSION] v2_2_13 CHRIS-ONLY BASELINE ACTIVE | no SCOT-inner-first change", flush=True)
-
-# =====================================================
-# Demand v12c1-FUTURETCN-DECODER-STOPGRAD-Z
-# Based on v12c0-READHAT-NOQ:
-#   1) Keep z-conditioned decoder + active-underforecast loss + H diagnostics.
-#   2) Keep READHAT support: default reads exposure_hat_for_demand_h3_nonrolling.csv from current working directory.
-#   3) Remove quantile/pinball loss from training (lambda_q forced to 0 by default).
-#   4) Remove QSHIFT reporting: p50_amxl = MC q50, p70_amxl = MC q70.
-#      No P50(q50) / P70(q70).
-#   5) Add future-horizon TCN before demand cross-attention.
-#   6) Connect decoder features to z only through a stop-gradient decoder epinet.
-# =====================================================
-
 """
-Clean demand model with external predicted exposure hats only.
+Joint exposure and demand forecasting for rolling three-week horizons.
 
-No internal exposure decoder.
-No true future DPH is used as demand input.
-Supported exposure modes:
-  - instock_only
-  - buybox_only
-  - all3
+The pipeline:
+  1. builds the eligible ASIN cohort for each rolling cut;
+  2. constructs historical, future-known, graph, and DPH proxy features;
+  3. trains a joint exposure-and-demand model;
+  4. generates demand quantiles and exposure forecasts;
+  5. aligns predictions with SCOT for evaluation;
+  6. saves one prediction.csv for each completed rolling cut.
+
+The three standardized WAPE functions are intentionally not defined here:
+  - calculate_wape_using_lp_oos2
+  - quick_error_check
+  - weekly_error_check
+
+Define them in the calling notebook before running the rolling pipeline.
 """
 
 import os
@@ -93,233 +79,25 @@ def _move_batch_to_device(batch, device):
     return out
 
 
-# =====================================================
-# Boss-provided WAPE utilities (verbatim, do not modify)
-# These are the standardized, company-approved WAPE/penalty
-# calculations. All demand WAPE reporting in this file must
-# route through calculate_wape_using_lp_oos2 + quick_error_check
-# (and weekly_error_check for the per-horizon breakdown) instead
-# of any locally rolled abs(pred-true)/true formula. Defining them
-# here also satisfies the rolling runner's own
-# "calculate_wape_using_lp_oos2 not in globals()" guard, so the
-# file no longer depends on these being pasted into the notebook
-# session beforehand.
-# =====================================================
-
-def calculate_wape_using_lp_oos2(df, quantiles, remove_oos_dp=False, source='lp'):
-
-    print(f"Shape when read in is {df.shape}")
-
-    if remove_oos_dp:
-        if source == 'lp':
-            df = df[df['oos_status'] == 0]
-        if source == 'amxl':
-            df = df[df['amxl_oos'] == 0]
-    else:
-        df = df.copy(deep=True)
-
-    print(f"Shape after remove oos is {df.shape}")
-
-    for quantile in quantiles:
-
-        print(f"Working on quantile {quantile}")
-
-        amxl_col = f'p{int(quantile*100)}_amxl'
-        scot_col = f'p{int(quantile*100)}_scot'
-
-        amxl_overbias_col = f'p{int(quantile*100)}_amxl_overbias'
-        scot_overbias_col = f'p{int(quantile*100)}_scot_overbias'
-
-        amxl_underbias_col = f'p{int(quantile*100)}_amxl_underbias'
-        scot_underbias_col = f'p{int(quantile*100)}_scot_underbias'
-
-        amxl_penalty_col = f'p{int(quantile*100)}_amxl_penalty'
-        scot_penalty_col = f'p{int(quantile*100)}_scot_penalty'
-
-        amxl_ob_wape_col = f'p{int(quantile*100)}_amxl_ob_wape'
-        scot_ob_wape_col = f'p{int(quantile*100)}_scot_ob_wape'
-
-        amxl_ub_wape_col = f'p{int(quantile*100)}_amxl_ub_wape'
-        scot_ub_wape_col = f'p{int(quantile*100)}_scot_ub_wape'
-
-        amxl_wape_col = f'p{int(quantile*100)}_amxl_wape'
-        scot_wape_col = f'p{int(quantile*100)}_scot_wape'
-
-        delta_wape_col = f'p{int(quantile*100)}_delta_wape'
-
-        df = df.dropna(subset=[amxl_col, scot_col])
-
-        print(f"Shape after remove when SCOT has null fcst is {df.shape}")
-
-        df[amxl_wape_col] = np.nan
-        df[scot_wape_col] = np.nan
-
-        df[amxl_overbias_col] = np.where(
-            (df[amxl_col] >= df['fbi_demand']),
-            abs(df[amxl_col] - df['fbi_demand']) * (1 - quantile),
-            0
-        )
-        df[scot_overbias_col] = np.where(
-            (df[scot_col] >= df['fbi_demand']),
-            abs(df[scot_col] - df['fbi_demand']) * (1 - quantile),
-            0
-        )
-        df[amxl_ob_wape_col] = np.where(
-            df['fbi_demand'] != 0,
-            df[amxl_overbias_col] / df['fbi_demand'],
-            np.nan
-        )
-        df[scot_ob_wape_col] = np.where(
-            df['fbi_demand'] != 0,
-            df[scot_overbias_col] / df['fbi_demand'],
-            np.nan
-        )
-
-        df[amxl_underbias_col] = np.where(
-            (df[amxl_col] < df['fbi_demand']),
-            abs(df[amxl_col] - df['fbi_demand']) * quantile,
-            0
-        )
-        df[scot_underbias_col] = np.where(
-            (df[scot_col] < df['fbi_demand']),
-            abs(df[scot_col] - df['fbi_demand']) * quantile,
-            0
-        )
-        df[amxl_ub_wape_col] = np.where(
-            df['fbi_demand'] != 0,
-            df[amxl_underbias_col] / df['fbi_demand'],
-            np.nan
-        )
-        df[scot_ub_wape_col] = np.where(
-            df['fbi_demand'] != 0,
-            df[scot_underbias_col] / df['fbi_demand'],
-            np.nan
-        )
-
-        df[amxl_penalty_col] = df[amxl_overbias_col] + df[amxl_underbias_col]
-        df[scot_penalty_col] = df[scot_overbias_col] + df[scot_underbias_col]
-
-        df[amxl_wape_col] = np.where(
-            df['fbi_demand'] != 0,
-            df[amxl_penalty_col] / df['fbi_demand'],
-            np.nan
-        )
-
-        df[scot_wape_col] = np.where(
-            df['fbi_demand'] != 0,
-            df[scot_penalty_col] / df['fbi_demand'],
-            np.nan
-        )
-
-        df[delta_wape_col] = df[amxl_wape_col] - df[scot_wape_col]
-
-    return df
+# =============================================================================
+# External Evaluation Dependencies
+#
+# The rolling evaluation calls the standardized functions below from the
+# notebook or parent runtime. They are deliberately not duplicated in this file.
+#
+# Required before calling the rolling runner:
+#   calculate_wape_using_lp_oos2
+#   quick_error_check
+#   weekly_error_check
+# =============================================================================
 
 
-def quick_error_check(df, cols):
-    original_output = df[cols].sum() / df['fbi_demand'].sum()
-
-    if 'p50_amxl_penalty' in cols:
-        penalty_diff = (df['p50_amxl_penalty'].sum() - df['p50_scot_penalty'].sum()) * 10000 / df['fbi_demand'].sum()
-    elif 'p70_amxl_penalty' in cols:
-        penalty_diff = (df['p70_amxl_penalty'].sum() - df['p70_scot_penalty'].sum()) * 10000 / df['fbi_demand'].sum()
-    elif 'p90_amxl_penalty' in cols:
-        penalty_diff = (df['p90_amxl_penalty'].sum() - df['p90_scot_penalty'].sum()) * 10000 / df['fbi_demand'].sum()
-
-    return original_output, penalty_diff
-
-
-def weekly_error_check(df, cols, cols_type):
-    """
-    Parameters:
-    df: DataFrame
-    cols: list of columns to analyze (unused, kept for signature compatibility)
-    cols_type: 'p50', 'p70', or 'p90' -- selects which quantile's per-horizon breakdown to build
-    """
-    if df.shape[0] > 0:
-
-        if cols_type == 'p50':
-            result = df.groupby(
-                ['fcst_week_index', ]
-            ).agg({
-                'p50_amxl_penalty': 'sum',
-                'p50_scot_penalty': 'sum',
-                'p50_amxl_overbias': 'sum',
-                'p50_scot_overbias': 'sum',
-                'p50_amxl_underbias': 'sum',
-                'p50_scot_underbias': 'sum',
-                'fbi_demand': 'sum',
-                'p50_amxl': 'sum',
-                'p70_amxl': 'sum',
-                'p50_scot': 'sum',
-                'p70_scot': 'sum'
-            }).reset_index()
-
-            result['penalty_win'] = np.where(result['p50_amxl_penalty'] < result['p50_scot_penalty'], 'win', 'lose')
-            result['over_win'] = np.where(result['p50_amxl_overbias'] < result['p50_scot_overbias'], 'win', 'lose')
-            result['under_win'] = np.where(result['p50_amxl_underbias'] < result['p50_scot_underbias'], 'win', 'lose')
-            result['p50_amxl_wape'] = result['p50_amxl_penalty'] / result['fbi_demand']
-            result['p50_scot_wape'] = result['p50_scot_penalty'] / result['fbi_demand']
-            result['p50_diff_bps'] = (result['p50_amxl_penalty'] - result['p50_scot_penalty']) * 10000 / result['fbi_demand']
-
-        if cols_type == 'p70':
-            result = df.groupby(
-                ['fcst_week_index', ]
-            ).agg({
-                'p70_amxl_penalty': 'sum',
-                'p70_scot_penalty': 'sum',
-                'p70_amxl_overbias': 'sum',
-                'p70_scot_overbias': 'sum',
-                'p70_amxl_underbias': 'sum',
-                'p70_scot_underbias': 'sum',
-                'fbi_demand': 'sum',
-                'p50_amxl': 'sum',
-                'p70_amxl': 'sum',
-                'p50_scot': 'sum',
-                'p70_scot': 'sum'
-            }).reset_index()
-
-            result['penalty_win'] = np.where(result['p70_amxl_penalty'] < result['p70_scot_penalty'], 'win', 'lose')
-            result['over_win'] = np.where(result['p70_amxl_overbias'] < result['p70_scot_overbias'], 'win', 'lose')
-            result['under_win'] = np.where(result['p70_amxl_underbias'] < result['p70_scot_underbias'], 'win', 'lose')
-            result['p70_amxl_wape'] = result['p70_amxl_penalty'] / result['fbi_demand']
-            result['p70_scot_wape'] = result['p70_scot_penalty'] / result['fbi_demand']
-            result['penalty_diff_bps'] = (result['p70_amxl_penalty'] - result['p70_scot_penalty']) * 10000 / result['fbi_demand']
-
-        if cols_type == 'p90':
-            result = df.groupby(
-                ['fcst_week_index', ]
-            ).agg({
-                'p90_amxl_penalty': 'sum',
-                'p90_scot_penalty': 'sum',
-                'p90_amxl_overbias': 'sum',
-                'p90_scot_overbias': 'sum',
-                'p90_amxl_underbias': 'sum',
-                'p90_scot_underbias': 'sum',
-                'fbi_demand': 'sum',
-                'p50_amxl': 'sum',
-                'p70_amxl': 'sum',
-                'p90_amxl': 'sum',
-                'p50_scot': 'sum',
-                'p70_scot': 'sum',
-                'p90_scot': 'sum'
-            }).reset_index()
-
-            result['penalty_win'] = np.where(result['p90_amxl_penalty'] < result['p90_scot_penalty'], 'win', 'lose')
-            result['over_win'] = np.where(result['p90_amxl_overbias'] < result['p90_scot_overbias'], 'win', 'lose')
-            result['under_win'] = np.where(result['p90_amxl_underbias'] < result['p90_scot_underbias'], 'win', 'lose')
-            result['p90_amxl_wape'] = result['p90_amxl_penalty'] / result['fbi_demand']
-            result['p90_scot_wape'] = result['p90_scot_penalty'] / result['fbi_demand']
-            result['penalty_diff_bps'] = (result['p90_amxl_penalty'] - result['p90_scot_penalty']) * 10000 / result['fbi_demand']
-        return result
-    else:
-        print('df has zero rows')
-        return pd.DataFrame()
-
-
-# =====================================================
-# 0. Sampling
-# =====================================================
+# =============================================================================
+# Cohort Sampling and Sparsity Labels
+#
+# Utilities in this section sample ASINs, intersect them with SCOT eligibility,
+# and calculate demand sparsity groups used by diagnostics.
+# =============================================================================
 
 def prepare_data_sample(data_raw1, n_asins=5000):
     data_raw1 = data_raw1.copy()
@@ -412,9 +190,13 @@ def add_zero_rate_group(data_raw, zero_thresholds=(0.4, 0.7)):
     return df, asin_stats
 
 
-# =====================================================
-# 1. Data loading
-# =====================================================
+# =============================================================================
+# Feature Engineering and ASIN Time-Series Construction
+#
+# Convert weekly raw records into one model-ready time series per ASIN.
+# Outputs include historical encoder features, future-known covariates,
+# forecast-origin-safe DPH proxies, targets, and diagnostic fields.
+# =============================================================================
 
 
 def _infer_pkg_dimension_cols(df):
@@ -1137,9 +919,16 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     return _ret_value
 
 
-# =====================================================
-# 2. Dataset
-# =====================================================
+# =============================================================================
+# Rolling Supervised Dataset
+#
+# Convert each ASIN time series into:
+#   - a fixed historical window;
+#   - future-known covariates for the forecast horizon;
+#   - demand and exposure targets used during training and evaluation.
+#
+# Forecast-origin-safe proxy values are computed from history only.
+# =============================================================================
 
 class DemandDataset(Dataset):
     def __init__(self, data, history=52, horizon=3, mode="train", val_weeks=20):
@@ -1231,9 +1020,22 @@ class DemandDataset(Dataset):
     def __getitem__(self, i): return self.samples[i]
 
 
-# =====================================================
-# 3. Model
-# =====================================================
+# =============================================================================
+# Model Architecture
+#
+# The model is organized into four conceptual parts:
+#   A. Historical encoder
+#   B. Latent uncertainty components
+#   C. Future-covariate decoder
+#   D. Demand distribution decoder
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# A. Historical Encoder
+#
+# Causal temporal convolutions and sparse peak-aware attention transform the
+# historical feature window into sequence states and a final ASIN state.
+# -----------------------------------------------------------------------------
 
 class CausalConv1d(nn.Module):
     def __init__(self, in_ch, out_ch, kernel_size, dilation):
@@ -1331,6 +1133,13 @@ class TCNSparseAttnEncoder(nn.Module):
         return mu, alpha, h_t
 
 
+
+# -----------------------------------------------------------------------------
+# B. Latent Uncertainty Components
+#
+# Generate context-conditioned latent variables and epistemic residuals used
+# for Monte Carlo demand-distribution sampling.
+# -----------------------------------------------------------------------------
 class ContextZGenerator(nn.Module):
     def __init__(self, d_phi=32, context_dim=2, d_z=16, horizon=3):
         super().__init__()
@@ -1375,6 +1184,13 @@ class Epinet(nn.Module):
 
 
 
+
+# -----------------------------------------------------------------------------
+# C. Future-Covariate Decoder
+#
+# Model interactions across forecast weeks and attend from future-known
+# covariates to the historical encoder states.
+# -----------------------------------------------------------------------------
 class HorizonTCNBlock(nn.Module):
     """Lightweight horizon-axis TCN block, matching the exposure decoder idea.
 
@@ -1562,6 +1378,13 @@ class DecoderPeakCrossAttention(nn.Module):
         return dec_h
 
 
+
+# -----------------------------------------------------------------------------
+# D. Demand Distribution Decoder
+#
+# Combine deterministic decoder states with stop-gradient epistemic residuals
+# to parameterize the future demand distribution.
+# -----------------------------------------------------------------------------
 class TCN_ENN(nn.Module):
     """Demand v12c1.
 
@@ -1754,9 +1577,12 @@ class TCN_ENN(nn.Module):
         return p50, p70
 
 
-# =====================================================
-# 4. Loss
-# =====================================================
+# =============================================================================
+# Training Losses
+#
+# Negative-binomial demand loss and auxiliary bias-related loss components.
+# The rolling runner controls which terms are active through its parameters.
+# =============================================================================
 
 def negbin_nll_elementwise(y, mu, alpha):
     eps = 1e-6
@@ -1833,9 +1659,12 @@ def active_overforecast_loss(y, mu, log_scale=True):
     return (active * over).sum() / active.sum().clamp(min=1.0)
 
 
-# =====================================================
-# 5. Diagnostics
-# =====================================================
+# =============================================================================
+# Representation and Training Diagnostics
+#
+# Optional diagnostics for encoder representations, batch behavior, occurrence
+# prediction, and magnitude separation. These do not alter model predictions.
+# =============================================================================
 
 def occurrence_probe_linear_nonlinear(h_ts, ys):
     """
@@ -2047,9 +1876,11 @@ def diagnose_training_batch(b, preds, epoch, bi, n_diag_batches=3):
     )
 
 
-# =====================================================
-# 6. Training
-# =====================================================
+# =============================================================================
+# Model Training
+#
+# Optimize the model, apply early stopping, and retain the best validation state.
+# =============================================================================
 
 def train(
     model,
@@ -2154,9 +1985,12 @@ def train(
     print(f"Best val: {best_val:.4f}")
 
 
-# =====================================================
-# 7. Evaluation and forecast generation
-# =====================================================
+# =============================================================================
+# Prediction and Diagnostic DataFrames
+#
+# Run Monte Carlo inference and convert model outputs into demand quantiles,
+# exposure forecasts, and optional diagnostic tables.
+# =============================================================================
 
 def evaluate(model, va_ld, M=100):
     all_y, all_p50, all_p70 = [], [], []
@@ -2293,9 +2127,11 @@ def magnitude_gap(diag_df):
     return out
 
 
-# =====================================================
-# 8. Run
-# =====================================================
+# =============================================================================
+# Non-Rolling Execution Helpers
+#
+# Entry points retained for single-run experiments and targeted sparse cohorts.
+# =============================================================================
 
 def filter_extreme_asins(data_high, demand_col="fbi_demand", asin_col="asin", q=0.99):
     """Memory-safe extreme-ASIN filtering.
@@ -2497,9 +2333,12 @@ def run_nb_high_sparse(
 
 
 
-# =====================================================
-# 9. Final WAPE summary
-# =====================================================
+# =============================================================================
+# External WAPE Evaluation Wrappers
+#
+# These wrappers prepare predictions for the standardized WAPE functions defined
+# in the calling notebook.
+# =============================================================================
 
 def run_final_wape(result, remove_oos_dp=True, source="lp"):
     """
@@ -2632,9 +2471,11 @@ def run_nb_high_sparse_with_wape(
 
 
 
-# =====================================================
-# 10. Sparse-group WAPE diagnostics
-# =====================================================
+# =============================================================================
+# Sparse-Cohort Evaluation
+#
+# Attach sparsity labels and summarize WAPE behavior by demand sparsity group.
+# =============================================================================
 
 def attach_zero_group_to_joined_df(joined_df, asin_stats):
     """
@@ -2759,9 +2600,12 @@ def summarize_wape_by_sparse_group(wape_df, joined_df_with_group):
 
 
 
-# =====================================================
-# 10b. Sparse-group horizon decay diagnostics
-# =====================================================
+# =============================================================================
+# Horizon Diagnostics by Sparsity Group
+#
+# Compare forecast behavior across horizons for low-, medium-, and high-sparsity
+# ASIN cohorts.
+# =============================================================================
 
 def _attach_zero_group_to_forecast_df_for_horizon_diag(forecast_df, asin_stats=None, data_raw1=None, zero_thresholds=(0.4, 0.7)):
     """Attach zero_rate / zero_group to forecast_df for horizon-level diagnostics."""
@@ -3062,9 +2906,12 @@ def summarize_h1_h20_magnitude_diagnostics(
     return {"by_horizon": by_h, "worst_horizons": worst}
 
 
-# =====================================================
-# 10. Real SCOT alignment and WAPE
-# =====================================================
+# =============================================================================
+# SCOT Alignment and Standardized Evaluation
+#
+# Normalize join keys, align model forecasts to SCOT rows, and call the external
+# standardized WAPE functions.
+# =============================================================================
 
 
 
@@ -3412,9 +3259,11 @@ def run_high_sparse_scot_alignment_wape(
     }
 
 
-# =====================================================
-# 11. Train on sample-SCOT intersection
-# =====================================================
+# =============================================================================
+# Sampled SCOT-Eligible Training
+#
+# Train on a sampled cohort after restricting ASINs to the SCOT intersection.
+# =============================================================================
 
 def run_nb_high_sparse_from_sample_scot_intersection(
     data_raw1,
@@ -3596,9 +3445,11 @@ def run_nb_high_sparse_from_sample_scot_intersection(
 
 
 
-# =====================================================
-# 12. Train on all sample-SCOT intersection ASINs
-# =====================================================
+# =============================================================================
+# Full SCOT-Eligible Training
+#
+# Train on all eligible ASINs in the selected SCOT intersection.
+# =============================================================================
 
 def run_nb_all_sample_scot_intersection(
     data_raw1,
@@ -3802,9 +3653,12 @@ def run_nb_all_sample_scot_intersection(
 
 # =====================================================
 
-# ============================================================
-# External exposure-3 injection into demand future_context
-# ============================================================
+# =============================================================================
+# External Exposure Covariates
+#
+# Load predicted total, buy-box, and in-stock DPH and append them to demand
+# future_context. Realized future DPH is never used as a demand input.
+# =============================================================================
 
 _ORIGINAL_LOAD_REAL_DATA_BEFORE_EXTERNAL_EXP3 = load_real_data
 
@@ -4373,9 +4227,12 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     return data, context_dim, context_cols
 
 
-# ============================================================
-# Clean usage helpers (NO auto-run)
-# ============================================================
+# =============================================================================
+# Demand Runs by Exposure-Covariate Mode
+#
+# Convenience entry points for all-three, in-stock-only, and buy-box-only
+# external exposure configurations. Nothing in this section runs automatically.
+# =============================================================================
 
 def run_demand_with_predicted_exposure_all3(
     data_raw1,
@@ -4521,15 +4378,13 @@ def run_demand_with_predicted_exposure_buybox_only(
 
 
 
-# ============================================================
-# PACKAGE-AWARE ASIN RELATION GRAPH CONTEXT PATCH
-# Added by ChatGPT: package-comparable peer graph features.
-# Design:
-#   - graph neighbors = same category_code + relaxed package-size/weight comparable
-#   - graph features are computed at forecast origin from historical values only
-#   - future target weeks are never used to construct graph context
-#   - features are injected into future_context so encoder/decoder/z can use them
-# ============================================================
+# =============================================================================
+# Package-Aware ASIN Graph Context
+#
+# Build peer relationships using category and relaxed package comparability.
+# Graph statistics are calculated at the forecast origin from historical values
+# only and are appended to future_context.
+# =============================================================================
 
 GRAPH_CONTEXT_COLS = [
     "graph_peer_total_mean13_log",
@@ -4913,27 +4768,17 @@ class _GraphContextMixin:
         return fc
 
 
-# ---- Demand-specific overrides ----
+# Demand dataset integration
 _ORIGINAL_LOAD_REAL_DATA_BEFORE_GRAPH_CONTEXT = load_real_data
 _ORIGINAL_DEMAND_DATASET_BEFORE_GRAPH_CONTEXT = DemandDataset
 
 
-# =====================================================
-# Parallel sample construction for DemandDataset.__init__
-# =====================================================
-# Building every training window's tensors is CPU-bound, pure-Python work
-# (dict + torch.tensor() construction per window) -- threads don't help here
-# because of the GIL, only separate processes do. This relies on the "fork"
-# start method (default on Linux): a module-level global is set to the
-# half-built dataset instance right before the worker pool is created, so
-# each forked worker inherits it via copy-on-write for free, with no
-# per-task pickling of the (potentially large) `data` dict. Workers call the
-# exact same `_make_future_context_with_dph_proxies` / `_inject_graph_context`
-# instance methods as the serial path -- there is no duplicated/rewritten
-# logic here, so results are identical to the single-process version, just
-# computed across multiple cores. If anything about the parallel path fails
-# (pickling, platform without fork, etc.) it falls back to the plain serial
-# loop automatically.
+# =============================================================================
+# Parallel Eager Sample Construction
+#
+# Build materialized Dataset samples across forked worker processes when
+# available. The serial path is used automatically if multiprocessing fails.
+# =============================================================================
 _MP_BUILD_DATASET = None
 
 
@@ -5267,9 +5112,12 @@ def summarize_graph_context_from_demand_result(result):
     print("external hats last3:", cols[-3:] if len(cols) >= 3 else cols)
     return {"graph_cols": present, "n_graph_cols": len(present), "context_dim": len(cols), "last3": cols[-3:] if len(cols) >= 3 else cols}
 
-# ============================================================
-# V12c3 H3 recommended current run: instock-only demand
-# ============================================================
+# =============================================================================
+# In-Stock-Only Demand Convenience Run
+#
+# Retained for focused experiments where predicted in-stock DPH is the only
+# exposure covariate supplied to the demand branch.
+# =============================================================================
 
 def run_demand_current_best_instock_only(
     data_raw1,
@@ -5359,12 +5207,28 @@ def run_demand_current_best_instock_only_from_hat_csv(
     )
 
 
-# ============================================================================
-# JOINT EXPOSURE + DEMAND H3 END-TO-END V1 (NON-ROLLING)
-# Shared history encoder + two separate future decoders.
-# Demand branch consumes predicted exposure from the exposure branch.
-# ============================================================================
+# =============================================================================
+# Joint Exposure and Demand Model
+#
+# A shared historical encoder feeds two future-facing branches:
+#
+#   Exposure covariate decoder
+#     Predicts total, buy-box, and in-stock DPH for each future week.
+#
+#   Demand decoder
+#     Consumes future-known covariates together with predicted exposure and
+#     produces the demand distribution used for Monte Carlo quantiles.
+#
+# Predicted exposure connects the two branches; realized future exposure is
+# never passed to the demand decoder.
+# =============================================================================
 
+
+# -----------------------------------------------------------------------------
+# Joint Model Composition
+#
+# Shared encoder -> exposure covariate decoder -> demand decoder.
+# -----------------------------------------------------------------------------
 class JointExposureDemandH3(nn.Module):
     """Experimental joint H3 model.
 
@@ -6038,9 +5902,11 @@ def run_joint_exposure_demand_h3_end2end(
 
 
 
-# ============================================================================
-# EXPOSURE HAT DIAGNOSTICS: OVERALL / HORIZON / CUT-HORIZON
-# ============================================================================
+# =============================================================================
+# Exposure Forecast Diagnostics
+#
+# Summarize exposure accuracy overall, by forecast horizon, and by rolling cut.
+# =============================================================================
 
 def _safe_exposure_corr(y_true, y_pred):
     y_true = np.asarray(y_true, dtype=float)
@@ -6317,9 +6183,18 @@ def print_exposure_hat_diagnostics(
     )
 
 
-# ============================================================================
-# ROLLING S3 RUNNER: JOINT H3 + MATCHED SCOT P50/P70
-# ============================================================================
+# =============================================================================
+# Rolling S3 Orchestration
+#
+# For each snapshot pair:
+#   1. read origin, evaluation, and SCOT data;
+#   2. construct the joint eligible cohort;
+#   3. build features and eager datasets;
+#   4. train the joint model;
+#   5. generate demand and exposure predictions;
+#   6. run standardized SCOT-aligned evaluation;
+#   7. save one prediction.csv.
+# =============================================================================
 
 import io
 import re
