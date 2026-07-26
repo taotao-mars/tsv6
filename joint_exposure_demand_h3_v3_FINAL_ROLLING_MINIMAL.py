@@ -17,7 +17,6 @@ The three standardized WAPE functions are intentionally not defined here:
 Define them in the calling notebook before running the rolling pipeline.
 """
 
-import hashlib
 import os
 import time
 import multiprocessing as mp
@@ -3072,6 +3071,8 @@ def run_joint_exposure_demand_h3_end2end(
 
     forecast_df = generate_joint_forecast_df(model, va_ld, M=M_eval)
     forecast_df["zero_group_run"] = "all_sample_scot_intersection"
+    output_csv = Path(output_csv)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
     forecast_df.to_csv(output_csv, index=False)
 
     exposure_metrics = _joint_exposure_metrics(forecast_df)
@@ -3738,8 +3739,9 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
         scot_fcd = pd.Timestamp(row["scot_fcd"])
         cut_token = _safe_file_token(data_cut)
 
-        cut_output_dir = output_root / f"cut_{cut_token}"
-        prediction_path = cut_output_dir / "prediction.csv"
+        # SageMaker/JupyterLab-friendly layout: keep all rolling outputs in
+        # one existing root directory and distinguish cuts by filename.
+        prediction_path = output_root / f"prediction_cut_{cut_token}.csv"
 
         print("\n" + "#" * 100)
         print(
@@ -3822,18 +3824,11 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 flush=True,
             )
 
-            # Make resume files cohort-specific. This prevents a run with a
-            # different n_asins / Chris cohort from silently loading an older
-            # forecast file for the same rolling cut.
-            cohort_hash = hashlib.sha1(
-                "\n".join(rolling_asins).encode("utf-8")
-            ).hexdigest()[:12]
-            cohort_tag = f"n{len(rolling_asins)}_seed{seed}_{cohort_hash}"
-            cut_output_dir = output_root / f"cut_{cut_token}_{cohort_tag}"
-            prediction_path = cut_output_dir / "prediction.csv"
+            # Store every rolling cut directly under output_root. The cut date
+            # is part of the filename, so no per-cut subdirectory is required.
+            prediction_path = output_root / f"prediction_cut_{cut_token}.csv"
             print(
-                f"[COHORT-CACHE] tag={cohort_tag} | "
-                f"prediction={prediction_path}",
+                f"[ROLLING-OUTPUT] prediction={prediction_path}",
                 flush=True,
             )
 
@@ -4278,7 +4273,8 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 # USAGE 1 OF 3: QUICK VALIDATION ON THE FIRST TWO ROLLING CUTS
 # ============================================================================
 # Use this small run to verify S3 loading, cohort construction, eager dataset
-# creation, training, WAPE evaluation, and prediction.csv export.
+# creation, training, WAPE evaluation, and per-cut CSV export.
+# Files are saved directly under joint_h3_usage1_quick_validation_5000/.
 #
 # rolling_joint_h3_test = run_joint_h3_s3_rolling_scot_p50_p70(
 #     n_asins=5000,
@@ -4292,7 +4288,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_h3_test_5000",
+#     output_root="joint_h3_usage1_quick_validation_5000",
 #     resume_existing=True,
 #     continue_on_error=False,
 # )
@@ -4305,7 +4301,11 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 # snapshot, SCOT cohort, and Chris cohort. It then samples up to n_asins from
 # that fully joined eligible cohort.
 #
-# Each completed cut writes exactly one prediction.csv containing:
+# Each completed cut writes one date-stamped CSV directly under
+# joint_h3_usage2_full_rolling_15000/, for example:
+#   prediction_cut_2025-10-04.csv
+#
+# Each file contains:
 #   - ASIN, order week, and forecast horizon
 #   - actual demand and model demand P50/P70/P90
 #   - actual and predicted total/buy-box/in-stock DPH
@@ -4323,7 +4323,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_h3_rolling_15000",
+#     output_root="joint_h3_usage2_full_rolling_15000",
 #     resume_existing=True,
 #     continue_on_error=True,
 # )
@@ -4334,7 +4334,8 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 # ============================================================================
 # Setting n_asins=None disables sampling. Every cut uses the complete
 # origin/evaluation/SCOT/Chris intersection. Use a separate output_root so
-# resume files remain isolated from sampled runs.
+# resume files remain isolated from sampled runs. Date-stamped CSV files
+# are saved directly under joint_h3_usage3_full_rolling_all_asins/.
 #
 # rolling_joint_h3_all_asins = run_joint_h3_s3_rolling_scot_p50_p70(
 #     n_asins=None,
@@ -4348,7 +4349,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_h3_rolling_all_eligible_asins",
+#     output_root="joint_h3_usage3_full_rolling_all_asins",
 #     resume_existing=True,
 #     continue_on_error=True,
 # )
