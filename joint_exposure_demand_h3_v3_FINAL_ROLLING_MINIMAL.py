@@ -9,12 +9,12 @@ The pipeline:
   5. aligns predictions with SCOT for evaluation;
   6. saves one prediction.csv for each completed rolling cut.
 
-The three standardized WAPE functions are intentionally not defined here:
+The three standardized WAPE functions are included at the top of this file:
   - calculate_wape_using_lp_oos2
   - quick_error_check
   - weekly_error_check
 
-Define them in the calling notebook before running the rolling pipeline.
+The rolling pipeline prepares their required columns without changing the scoring formulas.
 """
 
 import os
@@ -250,6 +250,164 @@ def weekly_error_check(df, cols, cols_type):
     else:
         print('df has zero rows')
         return pd.DataFrame()
+
+
+# =============================================================================
+# Standardized SCOT Alignment and WAPE Evaluation
+# =============================================================================
+
+def _evaluate_standard_wape_against_scot(
+    result,
+    scot_df,
+    data_raw1=None,
+    asin_stats=None,
+    remove_oos_dp=True,
+    source="lp",
+):
+    """
+    Align the joint-model forecasts with real SCOT P50/P70/P90 forecasts and
+    run the three standardized WAPE functions above.
+
+    The evaluator does not alter any WAPE formula. It only prepares the exact
+    AMXL/SCOT columns required by the approved evaluation functions.
+    """
+    if not isinstance(result, dict) or "forecast_df" not in result:
+        raise ValueError("result must be a dict containing forecast_df.")
+
+    forecast_df = result["forecast_df"].copy()
+    scot = scot_df.copy()
+
+    forecast_df.columns = [str(c).strip() for c in forecast_df.columns]
+    scot.columns = [str(c).strip() for c in scot.columns]
+
+    required_forecast = {
+        "asin", "order_week", "fcst_week_index", "fbi_demand",
+        "p50_amxl", "p70_amxl", "p90_amxl",
+    }
+    missing_forecast = sorted(required_forecast - set(forecast_df.columns))
+    if missing_forecast:
+        raise ValueError(
+            "Joint forecast is missing columns required by standardized WAPE: "
+            + ", ".join(missing_forecast)
+        )
+
+    scot_aliases = {
+        "p50_scot": ["forecast_qty_p50", "p50_scot", "scot_p50"],
+        "p70_scot": ["forecast_qty_p70", "p70_scot", "scot_p70"],
+        "p90_scot": ["forecast_qty_p90", "p90_scot", "scot_p90"],
+    }
+    selected_scot_cols = {}
+    for target, aliases in scot_aliases.items():
+        selected = next((c for c in aliases if c in scot.columns), None)
+        if selected is None:
+            raise ValueError(
+                f"SCOT data is missing the {target} forecast. "
+                f"Expected one of: {aliases}"
+            )
+        selected_scot_cols[target] = selected
+
+    for frame in (forecast_df, scot):
+        frame["asin"] = frame["asin"].astype(str).str.strip()
+        frame["order_week"] = pd.to_datetime(frame["order_week"], errors="coerce")
+
+    forecast_df = forecast_df.dropna(subset=["asin", "order_week"]).copy()
+    scot = scot.dropna(subset=["asin", "order_week"]).copy()
+
+    for target, source_col in selected_scot_cols.items():
+        scot[target] = pd.to_numeric(scot[source_col], errors="coerce")
+
+    scot_keep = (
+        scot[["asin", "order_week", "p50_scot", "p70_scot", "p90_scot"]]
+        .groupby(["asin", "order_week"], as_index=False)
+        .agg({
+            "p50_scot": "mean",
+            "p70_scot": "mean",
+            "p90_scot": "mean",
+        })
+    )
+
+    forecast_df_scot_real = forecast_df.merge(
+        scot_keep,
+        on=["asin", "order_week"],
+        how="inner",
+        validate="many_to_one",
+    )
+
+    if forecast_df_scot_real.empty:
+        raise RuntimeError(
+            "No ASIN-week rows matched between joint forecasts and SCOT. "
+            "Check ASIN formatting and order_week anchors."
+        )
+
+    forecast_df_scot_real["p70_scot"] = np.maximum(
+        forecast_df_scot_real["p70_scot"],
+        forecast_df_scot_real["p50_scot"],
+    )
+    forecast_df_scot_real["p90_scot"] = np.maximum(
+        forecast_df_scot_real["p90_scot"],
+        forecast_df_scot_real["p70_scot"],
+    )
+
+    print("\n" + "=" * 80)
+    print("REAL SCOT ALIGNMENT")
+    print("=" * 80)
+    print(f"Joint forecast rows: {len(forecast_df):,}")
+    print(f"Matched rows: {len(forecast_df_scot_real):,}")
+    print(f"Matched ASINs: {forecast_df_scot_real['asin'].nunique():,}")
+    print(
+        "Matched weeks:",
+        forecast_df_scot_real["order_week"].min(),
+        "to",
+        forecast_df_scot_real["order_week"].max(),
+    )
+
+    wape_df = calculate_wape_using_lp_oos2(
+        forecast_df_scot_real,
+        [0.5, 0.7, 0.9],
+        remove_oos_dp=remove_oos_dp,
+        source=source,
+    )
+
+    cols_by_quantile = {
+        "p50": [
+            "p50_amxl_penalty", "p50_scot_penalty",
+            "p50_amxl_overbias", "p50_scot_overbias",
+            "p50_amxl_underbias", "p50_scot_underbias",
+            "fbi_demand",
+        ],
+        "p70": [
+            "p70_amxl_penalty", "p70_scot_penalty",
+            "p70_amxl_overbias", "p70_scot_overbias",
+            "p70_amxl_underbias", "p70_scot_underbias",
+            "fbi_demand",
+        ],
+        "p90": [
+            "p90_amxl_penalty", "p90_scot_penalty",
+            "p90_amxl_overbias", "p90_scot_overbias",
+            "p90_amxl_underbias", "p90_scot_underbias",
+            "fbi_demand",
+        ],
+    }
+
+    outputs = {
+        "forecast_df_scot_real": forecast_df_scot_real,
+        "wape_df": wape_df,
+    }
+
+    for quantile, cols in cols_by_quantile.items():
+        wape, penalty_diff = quick_error_check(wape_df, cols)
+        horizon_wape = weekly_error_check(wape_df, cols, cols_type=quantile)
+        outputs[f"{quantile}_wape"] = wape
+        outputs[f"{quantile}_penalty_diff"] = penalty_diff
+        outputs[f"h_wape_{quantile}"] = horizon_wape
+
+        print("\n" + quantile.upper() + " WAPE")
+        print(wape)
+        print(f"{quantile.upper()} penalty diff AMXL - SCOT: {penalty_diff}")
+        print(f"{quantile.upper()} by horizon:")
+        print(horizon_wape.to_string(index=False))
+
+    return outputs
 
 # =====================================================
 # Chris ASIN cohort — loaded once for the whole rolling run
@@ -3320,14 +3478,14 @@ def run_joint_exposure_demand_h3_end2end(
         "extreme_cap": extreme_cap,
     }
 
-    # Demand WAPE is reported exclusively through the boss-approved
+    # Demand WAPE is reported exclusively through the approved
     # calculate_wape_using_lp_oos2 / quick_error_check / weekly_error_check
     # pipeline below -- no locally rolled abs(pred-true)/true formula.
     # Cohort and evaluation order match the standalone two-step H3 model:
     # sample n_asins -> SCOT intersection -> all sparse groups -> same extreme
     # filter -> H1-H3 validation rows -> same OOS-DP filter -> same real-SCOT
     # join -> same calculate_wape_using_lp_oos2 / quick_error_check WAPE.
-    result["real_scot_outputs"] = run_high_sparse_scot_alignment_wape(
+    result["real_scot_outputs"] = _evaluate_standard_wape_against_scot(
         result=result,
         scot_df=scot_df,
         data_raw1=data_raw1,
@@ -4143,11 +4301,11 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                     flush=True,
                 )
 
-                # Use the exact same evaluator as two-stage, even on resume.
+                # Use the standardized evaluator directly, including on resume.
                 result_stub = {
                     "forecast_df": forecast_df,
                 }
-                real_scot = run_high_sparse_scot_alignment_wape(
+                real_scot = _evaluate_standard_wape_against_scot(
                     result=result_stub,
                     scot_df=scot_df,
                     data_raw1=data_raw1,
