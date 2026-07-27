@@ -32,6 +32,225 @@ from sklearn.metrics import roc_auc_score
 torch.manual_seed(42)
 np.random.seed(42)
 
+
+# =============================================================================
+# Standardized WAPE Evaluation Functions (P50 / P70 / P90)
+#
+# These functions are kept verbatim from the approved notebook evaluation cell,
+# including the P90 extension. The model and rolling pipeline only prepare the
+# expected columns and call these functions; the scoring formulas are unchanged.
+# =============================================================================
+
+def calculate_wape_using_lp_oos2(df, quantiles, remove_oos_dp=False, source='lp'):
+
+    print(f"Shape when read in is {df.shape}")
+
+    if remove_oos_dp:
+        if source == 'lp':
+            df = df[df['oos_status'] == 0]
+        if source == 'amxl':
+            df = df[df['amxl_oos'] == 0]
+    else:
+        df = df.copy(deep=True)
+
+    print(f"Shape after remove oos is {df.shape}")
+
+    for quantile in quantiles:
+
+        print(f"Working on quantile {quantile}")
+
+        amxl_col = f'p{int(quantile*100)}_amxl'
+        scot_col = f'p{int(quantile*100)}_scot'
+
+        amxl_overbias_col = f'p{int(quantile*100)}_amxl_overbias'
+        scot_overbias_col = f'p{int(quantile*100)}_scot_overbias'
+
+        amxl_underbias_col = f'p{int(quantile*100)}_amxl_underbias'
+        scot_underbias_col = f'p{int(quantile*100)}_scot_underbias'
+
+        amxl_penalty_col = f'p{int(quantile*100)}_amxl_penalty'
+        scot_penalty_col = f'p{int(quantile*100)}_scot_penalty'
+
+        amxl_ob_wape_col = f'p{int(quantile*100)}_amxl_ob_wape'
+        scot_ob_wape_col = f'p{int(quantile*100)}_scot_ob_wape'
+
+        amxl_ub_wape_col = f'p{int(quantile*100)}_amxl_ub_wape'
+        scot_ub_wape_col = f'p{int(quantile*100)}_scot_ub_wape'
+
+        amxl_wape_col = f'p{int(quantile*100)}_amxl_wape'
+        scot_wape_col = f'p{int(quantile*100)}_scot_wape'
+
+        delta_wape_col = f'p{int(quantile*100)}_delta_wape'
+
+        df = df.dropna(subset=[amxl_col, scot_col])
+
+        print(f"Shape after remove when SCOT has null fcst is {df.shape}")
+
+        df[amxl_wape_col] = np.nan
+        df[scot_wape_col] = np.nan
+
+        df[amxl_overbias_col] = np.where(
+            (df[amxl_col] >= df['fbi_demand']),
+            abs(df[amxl_col] - df['fbi_demand']) * (1 - quantile),
+            0
+        )
+        df[scot_overbias_col] = np.where(
+            (df[scot_col] >= df['fbi_demand']),
+            abs(df[scot_col] - df['fbi_demand']) * (1 - quantile),
+            0
+        )
+        df[amxl_ob_wape_col] = np.where(
+            df['fbi_demand'] != 0,
+            df[amxl_overbias_col] / df['fbi_demand'],
+            np.nan
+        )
+        df[scot_ob_wape_col] = np.where(
+            df['fbi_demand'] != 0,
+            df[scot_overbias_col] / df['fbi_demand'],
+            np.nan
+        )
+
+        df[amxl_underbias_col] = np.where(
+            (df[amxl_col] < df['fbi_demand']),
+            abs(df[amxl_col] - df['fbi_demand']) * quantile,
+            0
+        )
+        df[scot_underbias_col] = np.where(
+            (df[scot_col] < df['fbi_demand']),
+            abs(df[scot_col] - df['fbi_demand']) * quantile,
+            0
+        )
+        df[amxl_ub_wape_col] = np.where(
+            df['fbi_demand'] != 0,
+            df[amxl_underbias_col] / df['fbi_demand'],
+            np.nan
+        )
+        df[scot_ub_wape_col] = np.where(
+            df['fbi_demand'] != 0,
+            df[scot_underbias_col] / df['fbi_demand'],
+            np.nan
+        )
+
+        df[amxl_penalty_col] = df[amxl_overbias_col] + df[amxl_underbias_col]
+        df[scot_penalty_col] = df[scot_overbias_col] + df[scot_underbias_col]
+
+        df[amxl_wape_col] = np.where(
+            df['fbi_demand'] != 0,
+            df[amxl_penalty_col] / df['fbi_demand'],
+            np.nan
+        )
+
+        df[scot_wape_col] = np.where(
+            df['fbi_demand'] != 0,
+            df[scot_penalty_col] / df['fbi_demand'],
+            np.nan
+        )
+
+        df[delta_wape_col] = df[amxl_wape_col] - df[scot_wape_col]
+
+    return df
+
+
+def quick_error_check(df, cols):
+    original_output = df[cols].sum() / df['fbi_demand'].sum()
+
+    if 'p50_amxl_penalty' in cols:
+        penalty_diff = (df['p50_amxl_penalty'].sum() - df['p50_scot_penalty'].sum()) * 10000 / df['fbi_demand'].sum()
+    elif 'p70_amxl_penalty' in cols:
+        penalty_diff = (df['p70_amxl_penalty'].sum() - df['p70_scot_penalty'].sum()) * 10000 / df['fbi_demand'].sum()
+    elif 'p90_amxl_penalty' in cols:
+        penalty_diff = (df['p90_amxl_penalty'].sum() - df['p90_scot_penalty'].sum()) * 10000 / df['fbi_demand'].sum()
+
+    return original_output, penalty_diff
+
+
+def weekly_error_check(df, cols, cols_type):
+    """
+    Parameters:
+    df: DataFrame
+    cols: list of columns to analyze (unused, kept for signature compatibility)
+    cols_type: 'p50', 'p70', or 'p90' -- selects which quantile's per-horizon breakdown to build
+    """
+    if df.shape[0] > 0:
+
+        if cols_type == 'p50':
+            result = df.groupby(
+                ['fcst_week_index', ]
+            ).agg({
+                'p50_amxl_penalty': 'sum',
+                'p50_scot_penalty': 'sum',
+                'p50_amxl_overbias': 'sum',
+                'p50_scot_overbias': 'sum',
+                'p50_amxl_underbias': 'sum',
+                'p50_scot_underbias': 'sum',
+                'fbi_demand': 'sum',
+                'p50_amxl': 'sum',
+                'p70_amxl': 'sum',
+                'p50_scot': 'sum',
+                'p70_scot': 'sum'
+            }).reset_index()
+
+            result['penalty_win'] = np.where(result['p50_amxl_penalty'] < result['p50_scot_penalty'], 'win', 'lose')
+            result['over_win'] = np.where(result['p50_amxl_overbias'] < result['p50_scot_overbias'], 'win', 'lose')
+            result['under_win'] = np.where(result['p50_amxl_underbias'] < result['p50_scot_underbias'], 'win', 'lose')
+            result['p50_amxl_wape'] = result['p50_amxl_penalty'] / result['fbi_demand']
+            result['p50_scot_wape'] = result['p50_scot_penalty'] / result['fbi_demand']
+            result['p50_diff_bps'] = (result['p50_amxl_penalty'] - result['p50_scot_penalty']) * 10000 / result['fbi_demand']
+
+        if cols_type == 'p70':
+            result = df.groupby(
+                ['fcst_week_index', ]
+            ).agg({
+                'p70_amxl_penalty': 'sum',
+                'p70_scot_penalty': 'sum',
+                'p70_amxl_overbias': 'sum',
+                'p70_scot_overbias': 'sum',
+                'p70_amxl_underbias': 'sum',
+                'p70_scot_underbias': 'sum',
+                'fbi_demand': 'sum',
+                'p50_amxl': 'sum',
+                'p70_amxl': 'sum',
+                'p50_scot': 'sum',
+                'p70_scot': 'sum'
+            }).reset_index()
+
+            result['penalty_win'] = np.where(result['p70_amxl_penalty'] < result['p70_scot_penalty'], 'win', 'lose')
+            result['over_win'] = np.where(result['p70_amxl_overbias'] < result['p70_scot_overbias'], 'win', 'lose')
+            result['under_win'] = np.where(result['p70_amxl_underbias'] < result['p70_scot_underbias'], 'win', 'lose')
+            result['p70_amxl_wape'] = result['p70_amxl_penalty'] / result['fbi_demand']
+            result['p70_scot_wape'] = result['p70_scot_penalty'] / result['fbi_demand']
+            result['penalty_diff_bps'] = (result['p70_amxl_penalty'] - result['p70_scot_penalty']) * 10000 / result['fbi_demand']
+
+        if cols_type == 'p90':
+            result = df.groupby(
+                ['fcst_week_index', ]
+            ).agg({
+                'p90_amxl_penalty': 'sum',
+                'p90_scot_penalty': 'sum',
+                'p90_amxl_overbias': 'sum',
+                'p90_scot_overbias': 'sum',
+                'p90_amxl_underbias': 'sum',
+                'p90_scot_underbias': 'sum',
+                'fbi_demand': 'sum',
+                'p50_amxl': 'sum',
+                'p70_amxl': 'sum',
+                'p90_amxl': 'sum',
+                'p50_scot': 'sum',
+                'p70_scot': 'sum',
+                'p90_scot': 'sum'
+            }).reset_index()
+
+            result['penalty_win'] = np.where(result['p90_amxl_penalty'] < result['p90_scot_penalty'], 'win', 'lose')
+            result['over_win'] = np.where(result['p90_amxl_overbias'] < result['p90_scot_overbias'], 'win', 'lose')
+            result['under_win'] = np.where(result['p90_amxl_underbias'] < result['p90_scot_underbias'], 'win', 'lose')
+            result['p90_amxl_wape'] = result['p90_amxl_penalty'] / result['fbi_demand']
+            result['p90_scot_wape'] = result['p90_scot_penalty'] / result['fbi_demand']
+            result['penalty_diff_bps'] = (result['p90_amxl_penalty'] - result['p90_scot_penalty']) * 10000 / result['fbi_demand']
+        return result
+    else:
+        print('df has zero rows')
+        return pd.DataFrame()
+
 # =====================================================
 # Chris ASIN cohort — loaded once for the whole rolling run
 # =====================================================
@@ -3667,6 +3886,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
         for name in [
             "calculate_wape_using_lp_oos2",
             "quick_error_check",
+            "weekly_error_check",
         ]
         if name not in globals()
     ]
@@ -3721,7 +3941,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     print("Seed:", seed)
     print("Output root:", output_root.resolve())
     print("Model unchanged from non-rolling V1.2: YES")
-    print("Metrics retained: P50 and P70 only")
+    print("Metrics retained: P50, P70, and P90")
     print(
         "WAPE: calls original calculate_wape_using_lp_oos2 "
         "+ quick_error_check; no local WAPE formula"
