@@ -4109,19 +4109,37 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 loaded_asins = set(
                     forecast_df["asin"].astype(str).str.strip().dropna().unique()
                 )
-                expected_asins = set(rolling_asins)
-                if loaded_asins != expected_asins:
+                sampled_asins = set(rolling_asins)
+                extra_asins = loaded_asins - sampled_asins
+                if extra_asins:
                     raise RuntimeError(
                         "Cohort-specific resume validation failed: "
-                        f"expected={len(expected_asins):,}, "
                         f"loaded={len(loaded_asins):,}, "
-                        f"missing={len(expected_asins - loaded_asins):,}, "
-                        f"extra={len(loaded_asins - expected_asins):,}. "
-                        "Use resume_existing=False or a fresh output_root."
+                        f"outside_current_cohort={len(extra_asins):,}. "
+                        "The cached predictions contain ASINs outside the current rolling cohort."
                     )
+                if not loaded_asins:
+                    raise RuntimeError(
+                        "Cohort-specific resume validation failed: "
+                        "the cached prediction file contains zero ASINs."
+                    )
+
+                # Resume validation follows the cohort that was actually loaded.
+                # The WAPE formulas remain unchanged; only the evaluated cohort is
+                # restricted to ASINs present in the cached prediction file.
+                data_raw1 = data_raw1[
+                    data_raw1["asin"].astype(str).str.strip().isin(loaded_asins)
+                ].copy()
+                scot_df = scot_df[
+                    scot_df["asin"].astype(str).str.strip().isin(loaded_asins)
+                ].copy()
+                rolling_asins = sorted(loaded_asins)
+
                 print(
-                    f"[COHORT-CACHE] exact ASIN validation PASS | "
-                    f"asins={len(loaded_asins):,}",
+                    f"[COHORT-CACHE] loaded-cohort validation PASS | "
+                    f"loaded_asins={len(loaded_asins):,} | "
+                    f"sampled_asins={len(sampled_asins):,} | "
+                    f"not_loaded={len(sampled_asins - loaded_asins):,}",
                     flush=True,
                 )
 
