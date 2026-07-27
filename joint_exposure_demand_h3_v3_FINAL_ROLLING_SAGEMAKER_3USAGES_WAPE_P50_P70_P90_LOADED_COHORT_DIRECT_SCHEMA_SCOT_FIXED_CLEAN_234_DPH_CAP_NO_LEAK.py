@@ -4286,37 +4286,37 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 loaded_asins = set(
                     forecast_df["asin"].astype(str).str.strip().dropna().unique()
                 )
-                sampled_asins = set(rolling_asins)
-                extra_asins = loaded_asins - sampled_asins
-                if extra_asins:
-                    raise RuntimeError(
-                        "Cohort-specific resume validation failed: "
-                        f"loaded={len(loaded_asins):,}, "
-                        f"outside_current_cohort={len(extra_asins):,}. "
-                        "The cached predictions contain ASINs outside the current rolling cohort."
-                    )
                 if not loaded_asins:
                     raise RuntimeError(
-                        "Cohort-specific resume validation failed: "
+                        "Resume validation failed: "
                         "the cached prediction file contains zero ASINs."
                     )
 
-                # Resume validation follows the cohort that was actually loaded.
-                # The WAPE formulas remain unchanged; only the evaluated cohort is
-                # restricted to ASINs present in the cached prediction file.
-                data_raw1 = data_raw1[
-                    data_raw1["asin"].astype(str).str.strip().isin(loaded_asins)
+                # Existing prediction.csv is authoritative for resume. If this
+                # rolling cut was completed previously, evaluate exactly the ASINs
+                # stored in that file; do not compare them with a newly sampled
+                # cohort, which may differ across reruns or parameter settings.
+                data_raw1 = eval_raw[
+                    eval_raw["asin"].astype(str).str.strip().isin(loaded_asins)
                 ].copy()
                 scot_df = scot_df[
                     scot_df["asin"].astype(str).str.strip().isin(loaded_asins)
                 ].copy()
                 rolling_asins = sorted(loaded_asins)
 
+                eval_loaded_asins = set(
+                    data_raw1["asin"].astype(str).str.strip().dropna().unique()
+                )
+                scot_loaded_asins = set(
+                    scot_df["asin"].astype(str).str.strip().dropna().unique()
+                )
                 print(
-                    f"[COHORT-CACHE] loaded-cohort validation PASS | "
-                    f"loaded_asins={len(loaded_asins):,} | "
-                    f"sampled_asins={len(sampled_asins):,} | "
-                    f"not_loaded={len(sampled_asins - loaded_asins):,}",
+                    f"[RESUME-CACHE] using existing prediction.csv | "
+                    f"prediction_asins={len(loaded_asins):,} | "
+                    f"available_in_eval={len(eval_loaded_asins):,} | "
+                    f"available_in_scot={len(scot_loaded_asins):,} | "
+                    f"missing_eval={len(loaded_asins - eval_loaded_asins):,} | "
+                    f"missing_scot={len(loaded_asins - scot_loaded_asins):,}",
                     flush=True,
                 )
 
