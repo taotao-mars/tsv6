@@ -291,20 +291,23 @@ def _evaluate_standard_wape_against_scot(
             + ", ".join(missing_forecast)
         )
 
-    scot_aliases = {
-        "p50_scot": ["forecast_qty_p50", "p50_scot", "scot_p50"],
-        "p70_scot": ["forecast_qty_p70", "p70_scot", "scot_p70"],
-        "p90_scot": ["forecast_qty_p90", "p90_scot", "scot_p90"],
+    # Use the exact SCOT schema supplied by the production forecast file.
+    required_scot = {
+        "asin", "order_week",
+        "forecast_qty_p50", "forecast_qty_p70", "forecast_qty_p90",
     }
-    selected_scot_cols = {}
-    for target, aliases in scot_aliases.items():
-        selected = next((c for c in aliases if c in scot.columns), None)
-        if selected is None:
-            raise ValueError(
-                f"SCOT data is missing the {target} forecast. "
-                f"Expected one of: {aliases}"
-            )
-        selected_scot_cols[target] = selected
+    missing_scot = sorted(required_scot - set(scot.columns))
+    if missing_scot:
+        raise ValueError(
+            "SCOT data is missing columns required by standardized WAPE: "
+            + ", ".join(missing_scot)
+        )
+
+    selected_scot_cols = {
+        "p50_scot": "forecast_qty_p50",
+        "p70_scot": "forecast_qty_p70",
+        "p90_scot": "forecast_qty_p90",
+    }
 
     for frame in (forecast_df, scot):
         frame["asin"] = frame["asin"].astype(str).str.strip()
@@ -563,36 +566,22 @@ def add_zero_rate_group(data_raw, zero_thresholds=(0.4, 0.7)):
 
 def _infer_pkg_dimension_cols(df):
     """
-    Infer package height, length, and width columns for package-volume diagnostics.
+    Use the package-dimension columns from the current modeling schema.
     Diagnostic only; not used as model input.
     """
-    lower_map = {c.lower(): c for c in df.columns}
-
-    candidates = {
-        "height": [
-            "pkg_height", "package_height", "pkg_h", "height",
-            "item_height", "unit_height"
-        ],
-        "length": [
-            "pkg_length", "package_length", "pkg_l", "length",
-            "item_length", "unit_length"
-        ],
-        "width": [
-            "pkg_width", "package_width", "pkg_w", "width",
-            "item_width", "unit_width"
-        ],
+    required = {
+        "height": "pkg_height",
+        "length": "pkg_length",
+        "width": "pkg_width",
     }
 
-    out = {}
+    missing = [col for col in required.values() if col not in df.columns]
+    if missing:
+        raise ValueError(
+            "Missing required package-dimension columns: " + ", ".join(missing)
+        )
 
-    for dim_name, names in candidates.items():
-        out[dim_name] = None
-        for name in names:
-            if name in lower_map:
-                out[dim_name] = lower_map[name]
-                break
-
-    return out
+    return required.copy()
 
 
 def _get_1d_col(df, col):
@@ -679,43 +668,43 @@ def _select_stock_decoder_extra_cols(data_raw):
 
 
 def _encode_stock_decoder_extra_features(df, extra_cols):
-    """
-    Convert extra external-exposure related features to numeric features.
-
-    Object/categorical columns are ordinal-encoded by pandas.factorize.
-    This keeps the implementation lightweight and avoids requiring sklearn encoders.
-    """
+    """Encode the three fixed stock-decoder context fields."""
     out_cols = []
 
     for c in extra_cols:
-        new_c = f"stock_extra__{c}"
-
         if c not in df.columns:
             continue
 
-        if pd.api.types.is_numeric_dtype(df[c]):
-            val = pd.to_numeric(_get_1d_col(df, c), errors="coerce").fillna(0.0)
+        new_c = f"stock_extra__{c}"
+        raw = _get_1d_col(df, c)
 
-            # Conservative transforms by feature type.
-            cl = c.lower()
-            if (
-                "count" in cl or "dph" in cl or "price" in cl
-                or "amount" in cl or "rank" in cl or "score" in cl
-                or "height" in cl or "length" in cl or "width" in cl
-                or "weight" in cl or "wordcount" in cl
-            ):
-                val = np.log1p(val.clip(lower=0))
-
-            # Scale robustly to avoid huge values.
+        if c == "ind_promotion":
+            val = pd.to_numeric(raw, errors="coerce").fillna(0.0)
             std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
             mean = float(val.mean())
             df[new_c] = ((val - mean) / std).clip(-5, 5)
 
+        elif c == "promotion_pricing_amount":
+            val = pd.to_numeric(raw, errors="coerce").fillna(0.0)
+            val = np.log1p(val.clip(lower=0))
+            std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
+            mean = float(val.mean())
+            df[new_c] = ((val - mean) / std).clip(-5, 5)
+
+        elif c == "pricing_type":
+            if pd.api.types.is_numeric_dtype(df[c]):
+                val = pd.to_numeric(raw, errors="coerce").fillna(0.0)
+                val = np.log1p(val.clip(lower=0))
+                std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
+                mean = float(val.mean())
+                df[new_c] = ((val - mean) / std).clip(-5, 5)
+            else:
+                codes, uniques = pd.factorize(raw.astype(str).fillna("MISSING"))
+                denom = max(len(uniques) - 1, 1)
+                df[new_c] = codes.astype(float) / denom
+
         else:
-            codes, uniques = pd.factorize(_get_1d_col(df, c).astype(str).fillna("MISSING"))
-            # normalize category code to roughly [0,1]
-            denom = max(len(uniques) - 1, 1)
-            df[new_c] = codes.astype(float) / denom
+            raise ValueError(f"Unexpected stock decoder feature: {c}")
 
         out_cols.append(new_c)
 
@@ -1014,21 +1003,26 @@ def load_real_data(data_raw, dph_cap_q=0.995):
         "season_fall",
     ]
 
-    # Major event proximity from distance_* columns.
-    # This is robust to slightly different distance column names.
-    event_keywords = [
-        "black", "cyber", "prime", "christmas", "thanksgiving",
-        "newyear", "new_year", "labor", "memorial",
+    # Major shopping-event proximity from the fixed input schema.
+    major_event_distance_cols = [
+        "distance_blackfriday",
+        "distance_cybermonday",
+        "distance_primeday",
+        "distance_christmasday",
+        "distance_thanksgivingday",
+        "distance_newyearseve",
+        "distance_laborday",
+        "distance_memorialday",
     ]
     proximity_cols = []
-    for c in distance_cols:
-        c_lower = c.lower()
-        if any(k in c_lower for k in event_keywords):
-            new_c = f"{c}_proximity"
-            data_raw[new_c] = (
-                1.0 - pd.to_numeric(data_raw[c], errors="coerce").fillna(0.0).abs()
-            ).clip(0.0, 1.0)
-            proximity_cols.append(new_c)
+    for c in major_event_distance_cols:
+        if c not in data_raw.columns:
+            continue
+        new_c = f"{c}_proximity"
+        data_raw[new_c] = (
+            1.0 - pd.to_numeric(data_raw[c], errors="coerce").fillna(0.0).abs()
+        ).clip(0.0, 1.0)
+        proximity_cols.append(new_c)
 
     # Include holiday indicators, raw distance features, explicit season features,
     # and major-event proximity features.
@@ -2566,12 +2560,6 @@ EXTERNAL_HAT_COLS = [
 ]
 
 
-def _reorder_future_context_keep_hats_last(data, context_cols):
-    """Compatibility no-op: final ordering is already produced in one pass above."""
-    context_cols = list(context_cols)
-    return data, len(context_cols), context_cols
-
-
 def load_real_data(data_raw, dph_cap_q=0.995):
     _wrapper_t0 = time.perf_counter()
     print("[PROFILE-WRAPPER 01] graph-context wrapper ENTERED", flush=True)
@@ -2614,18 +2602,6 @@ def load_real_data(data_raw, dph_cap_q=0.995):
     print(
         f"[PROFILE-GRAPH 02] graph preprocessing DONE | "
         f"elapsed={(time.perf_counter()-_graph_t0)/60:.2f}m",
-        flush=True,
-    )
-
-    _reorder_t0 = time.perf_counter()
-    print("[PROFILE-GRAPH 03] reorder future_context START", flush=True)
-    data, context_dim, context_cols = _reorder_future_context_keep_hats_last(
-        data,
-        context_cols,
-    )
-    print(
-        f"[PROFILE-GRAPH 04] reorder future_context DONE | "
-        f"elapsed={time.perf_counter()-_reorder_t0:.6f}s",
         flush=True,
     )
 
