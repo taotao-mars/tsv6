@@ -6485,8 +6485,8 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
         )
 
     output_root = Path(output_root)
-    per_cut_dir = output_root / "per_cut"
-    aligned_dir = output_root / "aligned_scot"
+    per_cut_dir = output_root / "jit_per_cut"
+    aligned_dir = output_root / "jit_aligned_scot"
     per_cut_dir.mkdir(parents=True, exist_ok=True)
     aligned_dir.mkdir(parents=True, exist_ok=True)
 
@@ -6523,7 +6523,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     pairs = pairs.reset_index(drop=True)
 
     print("\n" + "=" * 88)
-    print("JOINT H3 TRUE ROLLING + ORIGINAL WAPE + EXPOSURE DIAGNOSTICS")
+    print("JIT JOINT H3 TRUE ROLLING + ORIGINAL WAPE + EXPOSURE DIAGNOSTICS")
     print("=" * 88)
     print("Cuts selected:", len(pairs))
     print("Random ASIN sample after full joint per cut:", "ALL" if n_asins is None else n_asins)
@@ -6550,11 +6550,11 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 
         forecast_path = (
             per_cut_dir
-            / f"joint_h3_forecast_cut_{cut_token}.csv"
+            / f"jit_joint_h3_forecast_cut_{cut_token}.csv"
         )
         aligned_path = (
             aligned_dir
-            / f"joint_h3_scot_aligned_cut_{cut_token}.csv"
+            / f"jit_joint_h3_scot_aligned_cut_{cut_token}.csv"
         )
 
         print("\n" + "#" * 100)
@@ -6647,11 +6647,11 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             cohort_tag = f"n{len(rolling_asins)}_seed{seed}_{cohort_hash}"
             forecast_path = (
                 per_cut_dir
-                / f"joint_h3_forecast_cut_{cut_token}_{cohort_tag}.csv"
+                / f"jit_joint_h3_forecast_cut_{cut_token}_{cohort_tag}.csv"
             )
             aligned_path = (
                 aligned_dir
-                / f"joint_h3_scot_aligned_cut_{cut_token}_{cohort_tag}.csv"
+                / f"jit_joint_h3_scot_aligned_cut_{cut_token}_{cohort_tag}.csv"
             )
             print(
                 f"[COHORT-CACHE] tag={cohort_tag} | "
@@ -7046,7 +7046,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 )
 
             pd.DataFrame(summary_rows).to_csv(
-                output_root / "joint_rolling_p50_p70_summary.csv",
+                output_root / "jit_joint_rolling_p50_p70_summary.csv",
                 index=False,
             )
 
@@ -7076,7 +7076,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             })
 
             pd.DataFrame(summary_rows).to_csv(
-                output_root / "joint_rolling_p50_p70_summary.csv",
+                output_root / "jit_joint_rolling_p50_p70_summary.csv",
                 index=False,
             )
 
@@ -7091,7 +7091,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             ignore_index=True,
         )
         full_forecast_df.to_csv(
-            output_root / "joint_h3_forecast_full.csv",
+            output_root / "jit_joint_h3_forecast_full.csv",
             index=False,
         )
     else:
@@ -7103,14 +7103,14 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             ignore_index=True,
         )
         full_aligned_df.to_csv(
-            output_root / "joint_h3_scot_aligned_full.csv",
+            output_root / "jit_joint_h3_scot_aligned_full.csv",
             index=False,
         )
     else:
         full_aligned_df = pd.DataFrame()
 
     summary_df.to_csv(
-        output_root / "joint_rolling_p50_p70_summary.csv",
+        output_root / "jit_joint_rolling_p50_p70_summary.csv",
         index=False,
     )
 
@@ -7120,7 +7120,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             ignore_index=True,
         )
         exposure_overall_full.to_csv(
-            output_root / "exposure_hat_overall_by_cut.csv",
+            output_root / "jit_exposure_hat_overall_by_cut.csv",
             index=False,
         )
     else:
@@ -7132,7 +7132,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             ignore_index=True,
         )
         exposure_by_horizon_full.to_csv(
-            output_root / "exposure_hat_by_cut_and_horizon.csv",
+            output_root / "jit_exposure_hat_by_cut_and_horizon.csv",
             index=False,
         )
     else:
@@ -7156,15 +7156,15 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             title="EXPOSURE HAT DIAGNOSTICS | ALL ROLLING CUTS",
         )
         combined_exposure_diag["overall"].to_csv(
-            output_root / "exposure_hat_full_overall.csv",
+            output_root / "jit_exposure_hat_full_overall.csv",
             index=False,
         )
         combined_exposure_diag["by_horizon"].to_csv(
-            output_root / "exposure_hat_full_by_horizon.csv",
+            output_root / "jit_exposure_hat_full_by_horizon.csv",
             index=False,
         )
         combined_exposure_diag["by_cut_horizon"].to_csv(
-            output_root / "exposure_hat_full_by_cut_horizon.csv",
+            output_root / "jit_exposure_hat_full_by_cut_horizon.csv",
             index=False,
         )
     else:
@@ -7181,15 +7181,15 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     print("Failed cuts:", int((summary_df["status"] == "failed").sum()))
     print(
         "Summary:",
-        output_root / "joint_rolling_p50_p70_summary.csv",
+        output_root / "jit_joint_rolling_p50_p70_summary.csv",
     )
     print(
         "Full forecast:",
-        output_root / "joint_h3_forecast_full.csv",
+        output_root / "jit_joint_h3_forecast_full.csv",
     )
     print(
         "Full aligned SCOT:",
-        output_root / "joint_h3_scot_aligned_full.csv",
+        output_root / "jit_joint_h3_scot_aligned_full.csv",
     )
 
     return {
@@ -7220,7 +7220,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_true_rolling_h3_original_wape_exposure_diag",
+#     output_root="jit_joint_true_rolling_h3_original_wape_exposure_diag",
 #     resume_existing=True,
 #     continue_on_error=False,
 # )
@@ -7239,16 +7239,16 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_true_rolling_h3_original_wape_exposure_diag",
+#     output_root="jit_joint_true_rolling_h3_original_wape_exposure_diag",
 #     resume_existing=True,
 #     continue_on_error=True,
 # )
 #
 # All-ASIN run (no sampling -- n_asins=None uses every ASIN in each cut).
-# Uses its own output_root, separate from the n_asins=5000 runs above, so
+# Uses its own JIT output_root, separate from the sampled JIT runs above, so
 # resume_existing=True can never load a cached per-cut result that was
 # actually trained on the 5000-ASIN sample -- each output_root is its own
-# independent cache namespace, keyed only by data_cut, not by n_asins:
+# independent JIT cache namespace, keyed by data_cut and cohort tag:
 #
 # rolling_joint_h3_all_asins = run_joint_h3_s3_rolling_scot_p50_p70(
 #     n_asins=None,
@@ -7262,7 +7262,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_true_rolling_h3_all_asins",
+#     output_root="jit_joint_true_rolling_h3_all_asins",
 #     resume_existing=True,
 #     continue_on_error=True,
 # )
