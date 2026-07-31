@@ -6,7 +6,7 @@ print("[VERSION] v2_2_12 GRAPH_DEEP_PROFILE_MEMORY_SAFE_LAZY_WORKERS ACTIVE", fl
 print("[VERSION] Expected path: base load -> graph wrapper -> eager dataset -> single-process DataLoader", flush=True)
 print("#" * 96 + "\n", flush=True)
 print("[VERSION] v2_2_13 PREGRAPH_EXTERNAL_HAT_AND_GRAPH_BOUNDARY_PROFILE ACTIVE", flush=True)
-print("[VERSION] v2_2_13 JIT-ONLY BASELINE ACTIVE | no SCOT-inner-first change", flush=True)
+print("[VERSION] v2_2_13 JIT-ONLY BASELINE ACTIVE | extreme-ASIN filtering disabled", flush=True)
 
 # =====================================================
 # Demand v12c1-FUTURETCN-DECODER-STOPGRAD-Z
@@ -2304,106 +2304,22 @@ def magnitude_gap(diag_df):
 # =====================================================
 
 def filter_extreme_asins(data_high, demand_col="fbi_demand", asin_col="asin", q=0.99):
-    """Memory-safe extreme-ASIN filtering.
-
-    Important: ``data_high`` is already a dedicated dataframe created by the caller,
-    so this function intentionally consumes/mutates it in place to avoid making a
-    second ~10-12 GB copy.
     """
-    import gc
-    _all_t0 = time.time()
-    df = data_high  # NO full dataframe copy
+    Compatibility no-op for the JIT cohort.
 
+    The former 99th-percentile extreme-demand ASIN filter is disabled. This
+    function returns all rows unchanged, removes zero ASINs, and reports no cap.
+    """
+    df = data_high.copy()
+    removed = pd.DataFrame(columns=[asin_col])
+    cap = np.nan
     print(
-        f"[EXTREME-SAFE 01] ENTER | rows={len(df):,} | "
-        f"asins={df[asin_col].nunique():,} | q={q} | in_place=True",
-        flush=True,
-    )
-
-    _t0 = time.time()
-    print(f"[EXTREME-SAFE 02] clean demand column START", flush=True)
-    demand_numeric = pd.to_numeric(df[demand_col], errors="coerce")
-    demand_numeric = demand_numeric.fillna(0).clip(lower=0)
-    df[demand_col] = demand_numeric
-    del demand_numeric
-    gc.collect()
-    print(f"[EXTREME-SAFE 03] clean demand column DONE | elapsed={time.time()-_t0:.2f}s", flush=True)
-
-    _t0 = time.time()
-    print(f"[EXTREME-SAFE 04] positive quantile START", flush=True)
-    positive_mask = df[demand_col].to_numpy(copy=False) > 0
-    positive_values = df.loc[positive_mask, demand_col]
-    if len(positive_values) == 0:
-        del positive_mask, positive_values
-        gc.collect()
-        print(f"[EXTREME-SAFE 05] NO POSITIVE DEMAND | elapsed={time.time()-_all_t0:.2f}s", flush=True)
-        return df, pd.DataFrame(), np.nan
-    cap = float(positive_values.quantile(q))
-    del positive_mask, positive_values
-    gc.collect()
-    print(f"[EXTREME-SAFE 05] quantile DONE | cap={cap:.6f} | elapsed={time.time()-_t0:.2f}s", flush=True)
-
-    _t0 = time.time()
-    print("[EXTREME-SAFE 06] groupby peak START", flush=True)
-    asin_peak = (
-        df.groupby(asin_col, sort=False, observed=True)[demand_col]
-        .max()
-        .reset_index(name="asin_max")
-    )
-    bad_mask = asin_peak["asin_max"] > cap
-    bad_asins = asin_peak.loc[bad_mask, asin_col]
-    removed = asin_peak.loc[bad_mask].copy()
-    print(
-        f"[EXTREME-SAFE 07] groupby peak DONE | groups={len(asin_peak):,} | "
-        f"bad_asins={len(removed):,} | elapsed={time.time()-_t0:.2f}s",
-        flush=True,
-    )
-
-    _t0 = time.time()
-    print("[EXTREME-SAFE 08] locate rows to drop START", flush=True)
-    row_bad_mask = df[asin_col].isin(bad_asins).to_numpy(dtype=bool, copy=False)
-    bad_positions = np.flatnonzero(row_bad_mask)
-    bad_index = df.index.take(bad_positions)
-    n_bad_rows = len(bad_index)
-    del row_bad_mask, bad_positions, bad_asins, bad_mask, asin_peak
-    gc.collect()
-    print(
-        f"[EXTREME-SAFE 09] rows to drop READY | bad_rows={n_bad_rows:,} | "
-        f"elapsed={time.time()-_t0:.2f}s",
-        flush=True,
-    )
-
-    _t0 = time.time()
-    print(
-        f"[EXTREME-SAFE 10] in-place drop START | rows_before={len(df):,}",
-        flush=True,
-    )
-    df.drop(index=bad_index, inplace=True)
-    del bad_index
-    gc.collect()
-    print(
-        f"[EXTREME-SAFE 11] in-place drop DONE | rows_after={len(df):,} | "
-        f"elapsed={time.time()-_t0:.2f}s",
-        flush=True,
-    )
-
-    _t0 = time.time()
-    print("[EXTREME-SAFE 12] reset index START", flush=True)
-    df.reset_index(drop=True, inplace=True)
-    gc.collect()
-    print(
-        f"[EXTREME-SAFE 13] reset index DONE | asins={df[asin_col].nunique():,} | "
-        f"elapsed={time.time()-_t0:.2f}s",
-        flush=True,
-    )
-
-    print(
-        f"[EXTREME-SAFE 14] RETURN | cap={cap:.1f} | removed_asins={len(removed):,} | "
-        f"rows={len(df):,} | total_elapsed={time.time()-_all_t0:.2f}s",
+        "[EXTREME-FILTER] DISABLED | "
+        f"rows={len(df):,} | "
+        f"asins={df[asin_col].nunique() if asin_col in df.columns else 'NA'}",
         flush=True,
     )
     return df, removed, cap
-
 
 def run_nb_high_sparse(
     data_raw1,
@@ -2427,7 +2343,7 @@ def run_nb_high_sparse(
     lambda_stock=0.05,
     lambda_stock_mean_weight=0.30,
     dph_cap_q=0.995,
-    remove_extreme=True,
+    remove_extreme=False,
     extreme_q=0.99,
 ):
     print("="*70)
@@ -2599,7 +2515,7 @@ def run_nb_high_sparse_with_wape(
     lambda_stock=0.05,
     lambda_stock_mean_weight=0.30,
     dph_cap_q=0.995,
-    remove_extreme=True,
+    remove_extreme=False,
     extreme_q=0.99,
     remove_oos_dp=True,
 ):
@@ -3446,7 +3362,7 @@ def run_nb_high_sparse_from_sample_scot_intersection(
     lambda_stock=0.05,
     lambda_stock_mean_weight=0.30,
     dph_cap_q=0.995,
-    remove_extreme=True,
+    remove_extreme=False,
     extreme_q=0.99,
     run_wape=True,
     remove_oos_dp=True,
@@ -3630,7 +3546,7 @@ def run_nb_all_sample_scot_intersection(
     lambda_stock=0.05,
     lambda_stock_mean_weight=0.30,
     dph_cap_q=0.995,
-    remove_extreme=True,
+    remove_extreme=False,
     extreme_q=0.99,
     run_wape=True,
     remove_oos_dp=True,
@@ -4146,7 +4062,7 @@ def run_external_exposure3_in_old_decoder_style(
     lambda_stock=0.0,
     lambda_stock_mean_weight=0.0,
     dph_cap_q=0.995,
-    remove_extreme=True,
+    remove_extreme=False,
     extreme_q=0.99,
     run_wape=True,
     remove_oos_dp=True,
@@ -4428,7 +4344,7 @@ def run_demand_with_predicted_exposure_all3(
         lambda_z_reg=1.0,
         lambda_stock=0.0,
         lambda_stock_mean_weight=0.0,
-        remove_extreme=True,
+        remove_extreme=False,
         extreme_q=0.99,
         run_wape=True,
         remove_oos_dp=remove_oos_dp,
@@ -4473,7 +4389,7 @@ def run_demand_with_predicted_exposure_instock_only(
         lambda_z_reg=1.0,
         lambda_stock=0.0,
         lambda_stock_mean_weight=0.0,
-        remove_extreme=True,
+        remove_extreme=False,
         extreme_q=0.99,
         run_wape=True,
         remove_oos_dp=remove_oos_dp,
@@ -4519,7 +4435,7 @@ def run_demand_with_predicted_exposure_buybox_only(
         lambda_z_reg=1.0,
         lambda_stock=0.0,
         lambda_stock_mean_weight=0.0,
-        remove_extreme=True,
+        remove_extreme=False,
         extreme_q=0.99,
         run_wape=True,
         remove_oos_dp=remove_oos_dp,
@@ -5381,7 +5297,7 @@ def run_demand_current_best_instock_only(
         q_tail_weight=q_tail_weight,
         lambda_stock=0.0,
         lambda_stock_mean_weight=0.0,
-        remove_extreme=True,
+        remove_extreme=False,
         extreme_q=0.99,
         run_wape=True,
         remove_oos_dp=remove_oos_dp,
@@ -5802,7 +5718,7 @@ def run_joint_exposure_demand_h3_end2end(
     lambda_over=0.0,
     lambda_exposure=0.50,
     detach_exposure_for_demand=False,
-    remove_extreme=True,
+    remove_extreme=False,
     extreme_q=0.99,
     output_csv="joint_exposure_demand_h3_forecast_two_step_wape_aligned.csv",
     remove_oos_dp=True,
@@ -5852,12 +5768,12 @@ def run_joint_exposure_demand_h3_end2end(
     print("=" * 80)
     print("Sampled ASINs:", len(sample_asin_df))
     print("ASINs after SCOT intersection:", len(intersect_asin_df))
-    print("ASINs before extreme filtering:", data_use["asin"].nunique())
+    print("JIT ASINs retained before model loading:", data_use["asin"].nunique())
     print("Sparse groups are diagnostics only; no high_sparse-only filtering.", flush=True)
 
     _stage_t0 = time.time()
     print(
-        f"[STAGE] extreme filtering START | rows={len(data_use):,} | "
+        f"[STAGE] extreme filtering disabled | rows={len(data_use):,} | "
         f"asins={data_use['asin'].nunique():,} | remove_extreme={remove_extreme} | q={extreme_q}",
         flush=True,
     )
@@ -6519,7 +6435,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     lambda_over=0.0,
     lambda_exposure=0.50,
     detach_exposure_for_demand=False,
-    remove_extreme=True,
+    remove_extreme=False,
     extreme_q=0.99,
     remove_oos_dp=True,
     output_root="jit_joint_true_rolling_h3_original_wape_exposure_diag",
@@ -6543,6 +6459,12 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 
     Model architecture and losses are unchanged from the non-rolling V1.2 file.
     """
+    # JIT cohort policy: retain every eligible ASIN. The legacy 99th-percentile
+    # demand filter is permanently disabled, including for older notebook calls
+    # that still pass remove_extreme=True.
+    remove_extreme = False
+    extreme_q = None
+
     if horizon != 3:
         raise ValueError("This rolling experiment is H3 only.")
 
