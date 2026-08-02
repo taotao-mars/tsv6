@@ -566,7 +566,7 @@ def missingness_summary(detail: pd.DataFrame) -> pd.DataFrame:
 
 
 # ================================================================
-# NOTEBOOK CONFIG — edit only this block, then run the whole cell
+# NOTEBOOK CONFIG — paste this whole file into one Jupyter cell
 # ================================================================
 BUCKET = DEFAULT_BUCKET
 DATA_PREFIX = DEFAULT_DATA_PREFIX
@@ -574,48 +574,126 @@ DATA_PREFIX = DEFAULT_DATA_PREFIX
 CHRIS_CSV = "asin_list_from_amxl_fcst_scot_to_chris_20260723.csv"
 JIT_CSV = "jit_asin_list_from_Hrishi_20270727.csv"
 
-# Optional origin-cut filters. Keep None to use all available cuts.
-START_DATE = None          # example: "2026-01-01"
-END_DATE = None            # example: "2026-07-31"
-MAX_CUTS = 3               # run only the latest three origin cuts
-USE_LATEST_CUTS = True     # used only when MAX_CUTS is not None
-
-OUTPUT_DIR = "joint_chris_jit_promo_plan_vs_actual_and_lag1_h3"
+# Analyze only the latest three origin cuts.
+MAX_CUTS = 3
 
 
-def run_notebook_analysis():
-    output_dir = Path(OUTPUT_DIR)
-    output_dir.mkdir(parents=True, exist_ok=True)
+def _complete_case_mask(df: pd.DataFrame) -> pd.Series:
+    """
+    Keep only ASIN × horizon rows where PLAN, LAG1, and ACTUAL all exist for
+    all three fields. Selection is performed independently for every cut.
+    """
+    required = [
+        "plan_ind_promotion",
+        "lag1_ind_promotion",
+        "actual_ind_promotion",
+        "plan_promotion_pricing_amount",
+        "lag1_promotion_pricing_amount",
+        "actual_promotion_pricing_amount",
+        "plan_pricing_type",
+        "lag1_pricing_type",
+        "actual_pricing_type",
+    ]
+    return df[required].notna().all(axis=1)
 
+
+def _compact_summary(detail: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    rows = []
+
+    for keys, g in detail.groupby(group_cols, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        row = dict(zip(group_cols, keys))
+        row["rows"] = len(g)
+        row["asins"] = g["asin"].nunique()
+
+        # Binary/numeric promotion indicator
+        for field in ["ind_promotion", "promotion_pricing_amount"]:
+            plan_abs = pd.to_numeric(
+                g[f"plan_{field}_abs_error"], errors="coerce"
+            )
+            lag_abs = pd.to_numeric(
+                g[f"lag1_{field}_abs_error"], errors="coerce"
+            )
+            winner = g[f"{field}_winner"]
+
+            row[f"{field}_plan_mae"] = plan_abs.mean()
+            row[f"{field}_lag1_mae"] = lag_abs.mean()
+            row[f"{field}_plan_win_rate"] = (winner == "PLAN").mean()
+            row[f"{field}_lag1_win_rate"] = (winner == "LAG1").mean()
+            row[f"{field}_tie_rate"] = (winner == "TIE").mean()
+            row[f"{field}_lag1_improvement"] = (plan_abs - lag_abs).mean()
+
+        # Categorical pricing type
+        plan_match = pd.to_numeric(
+            g["plan_pricing_type_exact_match"], errors="coerce"
+        )
+        lag_match = pd.to_numeric(
+            g["lag1_pricing_type_exact_match"], errors="coerce"
+        )
+        winner = g["pricing_type_winner"]
+
+        row["pricing_type_plan_match_rate"] = plan_match.mean()
+        row["pricing_type_lag1_match_rate"] = lag_match.mean()
+        row["pricing_type_plan_win_rate"] = (winner == "PLAN").mean()
+        row["pricing_type_lag1_win_rate"] = (winner == "LAG1").mean()
+        row["pricing_type_tie_rate"] = (winner == "TIE").mean()
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def _print_interpretation(summary: pd.DataFrame, label: str) -> None:
+    print("\n" + "=" * 100)
+    print(label)
+    print("=" * 100)
+
+    if summary.empty:
+        print("没有完整可比较样本。")
+        return
+
+    show_cols = [
+        c for c in [
+            "data_cut",
+            "horizon",
+            "rows",
+            "asins",
+            "ind_promotion_plan_mae",
+            "ind_promotion_lag1_mae",
+            "ind_promotion_plan_win_rate",
+            "ind_promotion_lag1_win_rate",
+            "promotion_pricing_amount_plan_mae",
+            "promotion_pricing_amount_lag1_mae",
+            "promotion_pricing_amount_plan_win_rate",
+            "promotion_pricing_amount_lag1_win_rate",
+            "pricing_type_plan_match_rate",
+            "pricing_type_lag1_match_rate",
+            "pricing_type_plan_win_rate",
+            "pricing_type_lag1_win_rate",
+        ] if c in summary.columns
+    ]
+
+    with pd.option_context(
+        "display.max_columns", None,
+        "display.width", 220,
+        "display.float_format", lambda x: f"{x:.4f}",
+    ):
+        print(summary[show_cols].to_string(index=False))
+
+
+def run_last_three_cut_analysis():
     s3_client = boto3.client("s3")
+
     cuts = list_snapshot_cuts(
         bucket=BUCKET,
         data_prefix=DATA_PREFIX,
         s3_client=s3_client,
     )
-    pairs = build_origin_next_cut_pairs(cuts)
-
-    if START_DATE:
-        pairs = pairs[
-            pairs["data_cut"] >= pd.Timestamp(START_DATE).normalize()
-        ]
-    if END_DATE:
-        pairs = pairs[
-            pairs["data_cut"] <= pd.Timestamp(END_DATE).normalize()
-        ]
-
-    pairs = pairs.sort_values("data_cut")
-    if MAX_CUTS is not None:
-        pairs = (
-            pairs.tail(MAX_CUTS)
-            if USE_LATEST_CUTS
-            else pairs.head(MAX_CUTS)
-        )
+    pairs = build_origin_next_cut_pairs(cuts).sort_values("data_cut").tail(MAX_CUTS)
 
     if pairs.empty:
-        raise RuntimeError(
-            "No origin cuts with three later snapshots were found."
-        )
+        raise RuntimeError("没有找到具备后三个 snapshot 的 origin cut。")
 
     chris_set = _load_optional_cohort(CHRIS_CSV)
     jit_set = _load_optional_cohort(
@@ -623,28 +701,24 @@ def run_notebook_analysis():
         excluded_asins={"B01FV0F13E", "B073H7VJ37"},
     )
 
-    if chris_set is None or jit_set is None:
-        raise RuntimeError(
-            "Both Chris and JIT cohort CSV files are required."
-        )
+    if not chris_set or not jit_set:
+        raise RuntimeError("Chris 或 JIT cohort 文件为空/无法读取。")
 
     joint_set = chris_set & jit_set
     if not joint_set:
-        raise RuntimeError("Chris ∩ JIT cohort is empty.")
+        raise RuntimeError("Chris ∩ JIT 为空。")
 
     print(
-        f"Joint cohort loaded: Chris={len(chris_set):,} | "
-        f"JIT={len(jit_set):,} | intersection={len(joint_set):,}"
+        f"Chris={len(chris_set):,} | JIT={len(jit_set):,} | "
+        f"Joint={len(joint_set):,}"
+    )
+    print("只分析最近 3 个 origin cut；每个 cut 独立选择完整可比较行。")
+    print(
+        "完整行定义：PLAN、LAG1、ACTUAL 在三个字段上全部非空。"
     )
 
     read_columns = ["asin", "order_week", *PROMO_FIELDS]
-    all_detail = []
-
-    print("=" * 96)
-    print("CHRIS ∩ JIT JOINT (LATEST 3 CUTS): ORIGIN PLAN VS NEXT-CUT ACTUAL VS LAG1")
-    print("=" * 96)
-    print(f"Origins selected: {len(pairs)}")
-    print(f"Output directory: {output_dir.resolve()}")
+    complete_parts = []
 
     for i, row in pairs.reset_index(drop=True).iterrows():
         data_cut = pd.Timestamp(row["data_cut"])
@@ -654,43 +728,20 @@ def run_notebook_analysis():
             3: pd.Timestamp(row["h3_actual_cut"]),
         }
 
-        print(
-            f"[{i + 1}/{len(pairs)}] origin={data_cut.date()} | "
-            f"actual cuts="
-            f"H1:{actual_cut_by_horizon[1].date()}, "
-            f"H2:{actual_cut_by_horizon[2].date()}, "
-            f"H3:{actual_cut_by_horizon[3].date()}",
-            flush=True,
-        )
-
         origin_raw = _read_s3_csv_columns(
-            BUCKET,
-            row["origin_key"],
-            read_columns,
-            s3_client,
+            BUCKET, row["origin_key"], read_columns, s3_client
         )
         actual_raw_by_horizon = {
-            1: _read_s3_csv_columns(
+            h: _read_s3_csv_columns(
                 BUCKET,
-                row["h1_actual_key"],
+                row[f"h{h}_actual_key"],
                 read_columns,
                 s3_client,
-            ),
-            2: _read_s3_csv_columns(
-                BUCKET,
-                row["h2_actual_key"],
-                read_columns,
-                s3_client,
-            ),
-            3: _read_s3_csv_columns(
-                BUCKET,
-                row["h3_actual_key"],
-                read_columns,
-                s3_client,
-            ),
+            )
+            for h in [1, 2, 3]
         }
 
-        cut_detail = compare_one_origin(
+        detail = compare_one_origin(
             origin_raw=origin_raw,
             actual_raw_by_horizon=actual_raw_by_horizon,
             data_cut=data_cut,
@@ -698,70 +749,59 @@ def run_notebook_analysis():
             chris_set=chris_set,
             jit_set=jit_set,
         )
-        all_detail.append(cut_detail)
 
+        before = len(detail)
+        complete = detail.loc[_complete_case_mask(detail)].copy()
+        after = len(complete)
+
+        print("\n" + "-" * 100)
         print(
-            f"    rows={len(cut_detail):,} | "
-            f"asins={cut_detail['asin'].nunique():,}",
-            flush=True,
+            f"CUT {i + 1}: origin={data_cut.date()} | "
+            f"原始行={before:,} | 完整可比较行={after:,} | "
+            f"完整ASIN={complete['asin'].nunique():,}"
         )
 
-    detail = pd.concat(all_detail, ignore_index=True)
-    by_cut_horizon = summarize(
-        detail,
-        ["data_cut", "actual_cut", "horizon", "target_week"],
+        counts = (
+            complete.groupby("horizon")
+            .agg(rows=("asin", "size"), asins=("asin", "nunique"))
+            .reset_index()
+        )
+        print(counts.to_string(index=False))
+
+        cut_summary = _compact_summary(
+            complete,
+            ["data_cut", "horizon"],
+        )
+        _print_interpretation(
+            cut_summary,
+            f"CUT {data_cut.date()} — PLAN vs LAG1",
+        )
+
+        complete_parts.append(complete)
+
+    complete_all = pd.concat(complete_parts, ignore_index=True)
+
+    overall = _compact_summary(complete_all, ["horizon"])
+    _print_interpretation(
+        overall,
+        "最近三个 CUT 合并结果 — 按 H1/H2/H3",
     )
-    overall = summarize(detail, ["horizon"])
-    by_asin = summarize_by_asin(detail)
-    missing = missingness_summary(detail)
 
-    paths = {
-        "detail": output_dir / "promo_plan_lag1_vs_actual_detail.csv",
-        "by_cut_horizon": (
-            output_dir
-            / "promo_plan_lag1_vs_actual_summary_by_cut_horizon.csv"
-        ),
-        "overall": (
-            output_dir / "promo_plan_lag1_vs_actual_summary_overall.csv"
-        ),
-        "by_asin": (
-            output_dir / "promo_plan_lag1_vs_actual_winner_by_asin.csv"
-        ),
-        "missing": (
-            output_dir / "promo_plan_lag1_vs_actual_missingness.csv"
-        ),
-    }
+    total = _compact_summary(complete_all.assign(all="ALL"), ["all"])
+    _print_interpretation(
+        total,
+        "最近三个 CUT 合并结果 — 总体",
+    )
 
-    detail.to_csv(paths["detail"], index=False)
-    by_cut_horizon.to_csv(paths["by_cut_horizon"], index=False)
-    overall.to_csv(paths["overall"], index=False)
-    by_asin.to_csv(paths["by_asin"], index=False)
-    missing.to_csv(paths["missing"], index=False)
+    print("\n判读规则：")
+    print("1) MAE 越低越好。")
+    print("2) match rate 越高越好。")
+    print("3) PLAN win rate > LAG1 win rate：PLAN 更可靠。")
+    print("4) LAG1 win rate > PLAN win rate：说明该字段存在明显 lag/staleness。")
+    print("5) lag1_improvement = PLAN MAE - LAG1 MAE；正数代表 LAG1 更好。")
 
-    print("\nOVERALL: PLAN VS LAG1")
-    print(overall.to_string(index=False))
-    print("\nSaved:")
-    for path in paths.values():
-        print(f"  {path}")
-
-    return {
-        "detail": detail,
-        "by_cut_horizon": by_cut_horizon,
-        "overall": overall,
-        "by_asin": by_asin,
-        "missing": missing,
-        "paths": paths,
-    }
+    return complete_all, overall, total
 
 
-# Run immediately when this notebook cell is executed.
-results = run_notebook_analysis()
-
-# Convenient notebook variables for inspection.
-detail_df = results["detail"]
-overall_df = results["overall"]
-by_cut_horizon_df = results["by_cut_horizon"]
-by_asin_df = results["by_asin"]
-missing_df = results["missing"]
-
-display(overall_df)
+# Run immediately in the notebook cell. Nothing is written to disk.
+complete_detail_df, overall_df, total_df = run_last_three_cut_analysis()
