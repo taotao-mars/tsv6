@@ -195,9 +195,14 @@ def _selected_asins(
     chris_set: Optional[set[str]],
     jit_set: Optional[set[str]],
 ) -> list[str]:
+    """
+    Keep the fixed ASIN cohort for each origin cut.
+
+    Do NOT intersect with H1/H2/H3 actual availability. Missing plan or actual
+    values remain as NaN on that ASIN × horizon row and are handled only by
+    missingness/metric masks.
+    """
     selected = set(origin_asins)
-    for horizon in [1, 2, 3]:
-        selected &= actual_asins_by_horizon[horizon]
     if chris_set is not None:
         selected &= chris_set
     if jit_set is not None:
@@ -350,7 +355,7 @@ def compare_one_origin(
         actual_asins_by_horizon[h] = set(rows["asin"].dropna())
 
     selected = _selected_asins(
-        origin_asins=set(origin_plan_rows["asin"].dropna()),
+        origin_asins=set(origin["asin"].dropna()),
         actual_asins_by_horizon=actual_asins_by_horizon,
         chris_set=chris_set,
         jit_set=jit_set,
@@ -526,18 +531,16 @@ def summarize(detail: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
 
 
 def summarize_by_asin(detail: pd.DataFrame) -> pd.DataFrame:
-    summary = summarize(detail, ["asin", "horizon"])
+    if detail is None or detail.empty:
+        return pd.DataFrame(columns=["asin", "horizon"])
 
-    winner_columns = []
-    for field in PROMO_FIELDS:
-        for suffix in [
-            "plan_win_rate",
-            "lag1_win_rate",
-            "tie_rate",
-        ]:
-            col = f"{field}_{suffix}"
-            if col in summary.columns:
-                winner_columns.append(col)
+    required = {"asin", "horizon"}
+    if not required.issubset(detail.columns):
+        return pd.DataFrame(columns=["asin", "horizon"])
+
+    summary = summarize(detail, ["asin", "horizon"])
+    if summary.empty or not required.issubset(summary.columns):
+        return pd.DataFrame(columns=["asin", "horizon"])
 
     return summary.sort_values(["asin", "horizon"]).reset_index(drop=True)
 
@@ -574,7 +577,7 @@ JIT_CSV = "jit_asin_list_from_Hrishi_20270727.csv"
 # Optional origin-cut filters. Keep None to use all available cuts.
 START_DATE = None          # example: "2026-01-01"
 END_DATE = None            # example: "2026-07-31"
-MAX_CUTS = None            # example: 5
+MAX_CUTS = 3               # run only the latest three origin cuts
 USE_LATEST_CUTS = True     # used only when MAX_CUTS is not None
 
 OUTPUT_DIR = "joint_chris_jit_promo_plan_vs_actual_and_lag1_h3"
@@ -638,7 +641,7 @@ def run_notebook_analysis():
     all_detail = []
 
     print("=" * 96)
-    print("CHRIS ∩ JIT JOINT: ORIGIN PLAN VS NEXT-CUT ACTUAL VS LAG1")
+    print("CHRIS ∩ JIT JOINT (LATEST 3 CUTS): ORIGIN PLAN VS NEXT-CUT ACTUAL VS LAG1")
     print("=" * 96)
     print(f"Origins selected: {len(pairs)}")
     print(f"Output directory: {output_dir.resolve()}")
