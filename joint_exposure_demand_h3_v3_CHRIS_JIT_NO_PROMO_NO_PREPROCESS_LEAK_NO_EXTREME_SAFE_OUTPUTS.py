@@ -659,17 +659,24 @@ def _apply_dph_cap(df, cap):
 
 def _select_stock_decoder_extra_cols(data_raw):
     """
-    Return no stock-extra future features.
+    Select the three promotion/pricing fields as forecast-origin-known plan
+    features.
 
-    The following target-week fields are intentionally excluded from all model
-    inputs because their forecast-origin availability is not guaranteed:
-      - ind_promotion
-      - promotion_pricing_amount
-      - pricing_type
+    For every sample:
+      - H1/H2/H3 use the values already stored for those future order_weeks
+        in the current origin snapshot.
+      - Values from later evaluation snapshots are never used as model input.
+      - If an origin-snapshot plan value is missing, fall back to the latest
+        non-null value observable at or before the forecast origin.
 
-    They therefore cannot enter either the exposure decoder or demand decoder.
+    This preserves the real H1-H3 plan semantics without future leakage.
     """
-    return []
+    candidate_cols = [
+        "ind_promotion",
+        "promotion_pricing_amount",
+        "pricing_type",
+    ]
+    return [c for c in candidate_cols if c in data_raw.columns]
 
 
 def _encode_stock_decoder_extra_features(
@@ -719,28 +726,36 @@ def _encode_stock_decoder_extra_features(
         raw_fit = raw_all.loc[fit_mask]
 
         if pd.api.types.is_numeric_dtype(raw_all):
-            val_all = pd.to_numeric(raw_all, errors="coerce").fillna(0.0)
-            val_fit = pd.to_numeric(raw_fit, errors="coerce").fillna(0.0)
+            val_all = pd.to_numeric(raw_all, errors="coerce")
+            val_fit = pd.to_numeric(raw_fit, errors="coerce").dropna()
 
             if c in {"promotion_pricing_amount", "pricing_type"}:
                 val_all = np.log1p(val_all.clip(lower=0))
                 val_fit = np.log1p(val_fit.clip(lower=0))
 
-            mean = float(val_fit.mean())
-            fit_std = float(val_fit.std())
+            mean = float(val_fit.mean()) if len(val_fit) else 0.0
+            fit_std = float(val_fit.std()) if len(val_fit) else np.nan
             std = fit_std if np.isfinite(fit_std) and fit_std > 1e-8 else 1.0
-            df[new_c] = ((val_all - mean) / std).clip(-5, 5)
+
+            encoded = ((val_all - mean) / std).clip(-5, 5)
+            df[new_c] = encoded.astype(float)
 
         else:
             fit_values = (
-                raw_fit.fillna("MISSING").astype(str).drop_duplicates().tolist()
+                raw_fit.dropna().astype(str).str.strip().drop_duplicates().tolist()
             )
             mapping = {value: i + 1 for i, value in enumerate(sorted(fit_values))}
-            codes = (
-                raw_all.fillna("MISSING").astype(str).map(mapping).fillna(0)
-            )
+
+            raw_as_string = raw_all.astype("string").str.strip()
+            codes = raw_as_string.map(mapping)
             denom = max(len(mapping), 1)
-            df[new_c] = codes.astype(float) / denom
+
+            # Keep genuinely missing values as NaN so the dataset can apply
+            # lag1 fallback. Unseen non-null categories map to 0 (UNKNOWN).
+            encoded = codes.astype(float) / denom
+            unseen_non_null = raw_as_string.notna() & encoded.isna()
+            encoded.loc[unseen_non_null] = 0.0
+            df[new_c] = encoded
 
         out_cols.append(new_c)
 
@@ -824,9 +839,16 @@ def _zero_streak(active):
 _MP_LOAD_FEATURE_DF = None
 _MP_LOAD_CONTEXT_COLS = None
 _MP_LOAD_DPH_PROXY_COLS = None
+_MP_LOAD_STOCK_EXTRA_COLS = None
 
 
-def _build_one_asin_feature_record(asin, group, context_cols, dph_proxy_cols):
+def _build_one_asin_feature_record(
+    asin,
+    group,
+    context_cols,
+    dph_proxy_cols,
+    stock_extra_cols,
+):
     """Build one ASIN record with the same feature logic as the serial version."""
     # The parent DataFrame is already sorted by ASIN and Week. A group slice has a
     # fresh positional index only when needed; most operations use NumPy directly.
@@ -932,13 +954,16 @@ def _build_one_asin_feature_record(asin, group, context_cols, dph_proxy_cols):
         "dph_proxy_context_idx": {
             c: context_cols.index(c) for c in dph_proxy_cols if c in context_cols
         },
+        "stock_extra_context_idx": {
+            c: context_cols.index(c) for c in stock_extra_cols if c in context_cols
+        },
     }
 
 
 def _mp_load_feature_chunk_worker(task):
     """Process one contiguous ASIN-aligned row chunk inherited through fork."""
     worker_id, row_start, row_end, expected_asins = task
-    global _MP_LOAD_FEATURE_DF, _MP_LOAD_CONTEXT_COLS, _MP_LOAD_DPH_PROXY_COLS
+    global _MP_LOAD_FEATURE_DF, _MP_LOAD_CONTEXT_COLS, _MP_LOAD_DPH_PROXY_COLS, _MP_LOAD_STOCK_EXTRA_COLS
     t0 = time.perf_counter()
     print(
         f"[LOAD-W{worker_id}] START | rows={row_end-row_start:,} | "
@@ -949,7 +974,11 @@ def _mp_load_feature_chunk_worker(task):
     out = {}
     for i, (asin, group) in enumerate(chunk.groupby("ASIN", sort=False), start=1):
         asin_key, record = _build_one_asin_feature_record(
-            asin, group, _MP_LOAD_CONTEXT_COLS, _MP_LOAD_DPH_PROXY_COLS
+            asin,
+            group,
+            _MP_LOAD_CONTEXT_COLS,
+            _MP_LOAD_DPH_PROXY_COLS,
+            _MP_LOAD_STOCK_EXTRA_COLS,
         )
         out[asin_key] = record
         if i == 1 or i % 1000 == 0 or i == expected_asins:
@@ -1095,7 +1124,7 @@ def load_real_data(
 
     df = data_raw[keep_cols].copy()
 
-    # No promotion stock-extra fields are selected in this leakage-safe version.
+    # Encode origin-snapshot H1-H3 promotion plans using history-only fitted transforms.
     df, stock_extra_cols = _encode_stock_decoder_extra_features(
         df,
         stock_extra_raw_cols,
@@ -1103,8 +1132,8 @@ def load_real_data(
         week_col="order_week",
     )
 
-    # Add only explicitly selected, forecast-origin-safe stock-extra columns.
-    # This version selects none.
+    # Add encoded origin-snapshot H1-H3 promotion plans to future context.
+    # DemandDataset keeps valid plan values and uses lag1 only for missing cells.
     context_cols = context_cols + stock_extra_cols
 
     # Forecast-origin-safe historical DPH proxy features.
@@ -1248,10 +1277,11 @@ def load_real_data(
                 raise RuntimeError(
                     "spawn start method would pickle the full DataFrame; using serial fallback"
                 )
-            global _MP_LOAD_FEATURE_DF, _MP_LOAD_CONTEXT_COLS, _MP_LOAD_DPH_PROXY_COLS
+            global _MP_LOAD_FEATURE_DF, _MP_LOAD_CONTEXT_COLS, _MP_LOAD_DPH_PROXY_COLS, _MP_LOAD_STOCK_EXTRA_COLS
             _MP_LOAD_FEATURE_DF = df
             _MP_LOAD_CONTEXT_COLS = context_cols
             _MP_LOAD_DPH_PROXY_COLS = dph_proxy_cols
+            _MP_LOAD_STOCK_EXTRA_COLS = stock_extra_cols
             print(
                 f"[LOAD] launching {len(_tasks)} fork workers...",
                 flush=True,
@@ -1289,12 +1319,17 @@ def load_real_data(
             _MP_LOAD_FEATURE_DF = None
             _MP_LOAD_CONTEXT_COLS = None
             _MP_LOAD_DPH_PROXY_COLS = None
+            _MP_LOAD_STOCK_EXTRA_COLS = None
 
     if not _used_parallel:
         _serial_t0 = time.perf_counter()
         for _asin_i, (asin, group) in enumerate(df.groupby("ASIN", sort=False), start=1):
             asin_key, record = _build_one_asin_feature_record(
-                asin, group, context_cols, dph_proxy_cols
+                asin,
+                group,
+                context_cols,
+                dph_proxy_cols,
+                stock_extra_cols,
             )
             data[asin_key] = record
             if _asin_i == 1 or _asin_i % 2000 == 0 or _asin_i == _n_asins:
@@ -1432,6 +1467,24 @@ class DemandDataset(Dataset):
             fill("hist_instock_dph_last_log", instock_last)
             fill("hist_instock_dph_mean4_log", self._safe_hist_mean(instock_hist, start, history, 4))
             fill("hist_instock_dph_mean13_log", self._safe_hist_mean(instock_hist, start, history, 13))
+
+        # Promotion/pricing plan semantics:
+        # `fc` already contains H1-H3 values from THIS origin snapshot, which
+        # are the forecast-origin-known planned values for the three target
+        # order_weeks. Do not overwrite valid plan values.
+        #
+        # Only when an origin-plan cell is missing/non-finite do we use lag1:
+        # the latest value observable at or before the forecast origin.
+        origin_idx = start + history - 1
+        stock_idx = d.get("stock_extra_context_idx", {})
+        if origin_idx >= 0 and origin_idx < len(d["future_context"]):
+            for _, col_idx in stock_idx.items():
+                lag1_value = d["future_context"][origin_idx, col_idx]
+                plan_values = fc[:, col_idx]
+
+                missing_plan = ~np.isfinite(plan_values)
+                if np.isfinite(lag1_value) and np.any(missing_plan):
+                    fc[missing_plan, col_idx] = lag1_value
 
         return fc
 
@@ -3900,17 +3953,19 @@ def list_joint_rolling_snapshot_pairs(
     s3_client=None,
 ):
     """
-    Build one cut-local rolling backtest package.
+    Build a leakage-controlled rolling backtest pairing.
 
     For origin snapshot date D (Saturday):
       - SCOT FCD is D + 1 day (Sunday)
-      - H1/H2/H3 are FCD, FCD + 7 days, and FCD + 14 days
-      - the D + 21 snapshot is used only as the source of realized target rows
-        for those exact three order_week values
+      - evaluation snapshot is D + 21 days
 
-    No rows outside the current cut's own H1-H3 target weeks are imported from
-    the later snapshot. The origin snapshot remains the source of historical
-    model inputs and all preprocessing fit statistics.
+    Why D + 21?
+      The evaluation snapshot's final observed Sunday is the SCOT H3 week.
+      Therefore the existing non-rolling validation logic (last 3 weeks)
+      produces exactly:
+        H1 = FCD
+        H2 = FCD + 7 days
+        H3 = FCD + 14 days
 
     Example:
       origin snapshot: 2025-10-04, max observed week 2025-09-28
@@ -4012,118 +4067,6 @@ def _read_s3_parquet(bucket, key, s3_client=None):
     return pd.read_parquet(io.BytesIO(body))
 
 
-
-def _build_cut_local_h3_dataframe(
-    origin_raw,
-    eval_raw,
-    rolling_asins,
-    expected_h1,
-    expected_h2,
-    expected_h3,
-):
-    """
-    Construct one rolling cut without borrowing unrelated rows from later cuts.
-
-    Historical rows come from the current origin snapshot. The later evaluation
-    snapshot contributes only the realized rows for this cut's exact H1-H3
-    order_week values. This preserves the existing H3 target construction while
-    preventing the full later snapshot from becoming model input.
-
-    The three removed promotion fields are also dropped defensively if present.
-    """
-    target_weeks = pd.DatetimeIndex([
-        pd.Timestamp(expected_h1),
-        pd.Timestamp(expected_h2),
-        pd.Timestamp(expected_h3),
-    ])
-
-    origin_part = origin_raw[
-        origin_raw["asin"].isin(rolling_asins)
-    ].copy()
-
-    eval_targets = eval_raw[
-        eval_raw["asin"].isin(rolling_asins)
-        & eval_raw["order_week"].isin(target_weeks)
-    ].copy()
-
-    if origin_part.empty:
-        raise RuntimeError(
-            "The current origin snapshot has no rows for the selected cohort."
-        )
-    if eval_targets.empty:
-        raise RuntimeError(
-            "The current cut has no realized H1-H3 target rows in its paired "
-            "evaluation snapshot."
-        )
-
-    # Never allow these target-week actual promotion fields to enter inputs.
-    unsafe_future_cols = [
-        "ind_promotion",
-        "promotion_pricing_amount",
-        "pricing_type",
-    ]
-    for frame in (origin_part, eval_targets):
-        drop_cols = [c for c in unsafe_future_cols if c in frame.columns]
-        if drop_cols:
-            frame.drop(columns=drop_cols, inplace=True)
-
-    # Keep the origin snapshot as authoritative where duplicate ASIN-week rows
-    # exist. Evaluation rows are appended only for the exact future H1-H3 weeks.
-    origin_keys = set(
-        zip(
-            origin_part["asin"].astype(str),
-            pd.to_datetime(origin_part["order_week"], errors="coerce"),
-        )
-    )
-    eval_keys = list(
-        zip(
-            eval_targets["asin"].astype(str),
-            pd.to_datetime(eval_targets["order_week"], errors="coerce"),
-        )
-    )
-    keep_eval = [key not in origin_keys for key in eval_keys]
-    eval_targets = eval_targets.loc[keep_eval].copy()
-
-    combined = pd.concat(
-        [origin_part, eval_targets],
-        ignore_index=True,
-        sort=False,
-    )
-    combined["order_week"] = pd.to_datetime(
-        combined["order_week"], errors="coerce"
-    )
-    combined = (
-        combined.dropna(subset=["asin", "order_week"])
-        .sort_values(["asin", "order_week"])
-        .reset_index(drop=True)
-    )
-
-    actual_target_weeks = sorted(
-        pd.to_datetime(
-            combined.loc[
-                combined["order_week"].isin(target_weeks),
-                "order_week",
-            ],
-            errors="coerce",
-        ).dropna().unique()
-    )
-    expected_target_weeks = sorted(target_weeks.to_numpy())
-    if actual_target_weeks != expected_target_weeks:
-        raise RuntimeError(
-            "Cut-local H1-H3 construction failed. "
-            f"Expected={expected_target_weeks}, actual={actual_target_weeks}."
-        )
-
-    print(
-        f"[CUT-LOCAL-H3] origin_rows={len(origin_part):,} | "
-        f"eval_target_rows={len(eval_targets):,} | "
-        f"combined_rows={len(combined):,} | "
-        f"target_weeks={[d.date() for d in target_weeks]}",
-        flush=True,
-    )
-    return combined
-
-
 def _extract_wape_metrics(wape_object, prefix):
     """
     Flatten the P50/P70 object returned by the existing two-step evaluator.
@@ -4195,7 +4138,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     remove_extreme=False,
     extreme_q=None,
     remove_oos_dp=True,
-    output_root="chris_jit_cut_local_h3_no_promo_outputs",
+    output_root="chris_jit_origin_plan_promo_rolling_h3_outputs",
     resume_existing=True,
     continue_on_error=True,
     bucket=ROLLING_S3_BUCKET,
@@ -4397,7 +4340,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             ).hexdigest()[:12]
             cohort_tag = f"n{len(rolling_asins)}_seed{seed}_{cohort_hash}"
             prediction_path = output_root / (
-                f"chris_jit_cut_local_prediction_{cut_token}_{cohort_tag}.csv"
+                f"chris_jit_prediction_cut_{cut_token}_{cohort_tag}.csv"
             )
             print(
                 f"[ROLLING-OUTPUT] cohort_tag={cohort_tag} | "
@@ -4405,23 +4348,20 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 flush=True,
             )
 
+            # Use the later evaluation snapshot to supply the actual H1-H3
+            # rows, restricted to the already-joined and then sampled cohort.
+            data_raw1 = eval_raw[
+                eval_raw["asin"].isin(rolling_asins)
+            ].copy()
+
+            if data_raw1.empty:
+                raise RuntimeError(
+                    "No rows remain after joined-cohort sampling."
+                )
+
             expected_h1 = pd.Timestamp(row["scot_fcd"])
             expected_h2 = expected_h1 + pd.Timedelta(days=7)
             expected_h3 = expected_h1 + pd.Timedelta(days=14)
-
-            # Current-cut construction:
-            #   - current origin snapshot supplies all historical rows;
-            #   - its paired evaluation snapshot supplies only this cut's exact
-            #     H1/H2/H3 realized target rows;
-            #   - no other future order weeks or future-cut rows are imported.
-            data_raw1 = _build_cut_local_h3_dataframe(
-                origin_raw=origin_raw,
-                eval_raw=eval_raw,
-                rolling_asins=rolling_asins,
-                expected_h1=expected_h1,
-                expected_h2=expected_h2,
-                expected_h3=expected_h3,
-            )
 
             # Last actually observable week at this rolling forecast origin.
             # Estimate the global DPH cap only from these origin-snapshot rows;
@@ -4440,7 +4380,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             print("ROLLING COHORT + TARGET-WEEK CONSTRUCTION")
             print("=" * 96)
             print("Origin snapshot:", pd.Timestamp(row["data_cut"]).date())
-            print("Paired target snapshot:", pd.Timestamp(row["eval_cut"]).date())
+            print("Evaluation snapshot:", pd.Timestamp(row["eval_cut"]).date())
             print("SCOT FCD:", expected_h1.date())
             print(
                 "Origin max observed week:",
@@ -4451,7 +4391,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 pd.Timestamp(dph_cap_end_week),
             )
             print(
-                "Paired snapshot max observed week (targets are restricted to H1-H3):",
+                "Evaluation max observed week:",
                 eval_raw["order_week"].max(),
             )
             print(
@@ -4463,7 +4403,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             print("Evaluation ASINs:", len(eval_set))
             print("Final rolling ASIN intersection:", len(rolling_asins))
             print(
-                f"Cut-local origin+H1-H3 rows used={len(data_raw1):,} | "
+                f"Evaluation rows used={len(data_raw1):,} | "
                 f"ASINs={data_raw1['asin'].nunique():,}"
             )
 
@@ -4492,14 +4432,9 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 # rolling cut was completed previously, evaluate exactly the ASINs
                 # stored in that file; do not compare them with a newly sampled
                 # cohort, which may differ across reruns or parameter settings.
-                data_raw1 = _build_cut_local_h3_dataframe(
-                    origin_raw=origin_raw,
-                    eval_raw=eval_raw,
-                    rolling_asins=sorted(loaded_asins),
-                    expected_h1=expected_h1,
-                    expected_h2=expected_h2,
-                    expected_h3=expected_h3,
-                )
+                data_raw1 = eval_raw[
+                    eval_raw["asin"].astype(str).str.strip().isin(loaded_asins)
+                ].copy()
                 scot_df = scot_df[
                     scot_df["asin"].astype(str).str.strip().isin(loaded_asins)
                 ].copy()
@@ -4892,7 +4827,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 # ============================================================================
 # Use this small run to verify S3 loading, cohort construction, eager dataset
 # creation, training, WAPE evaluation, and per-cut CSV export.
-# Files are saved directly under chris_jit_cut_local_usage1_quick_validation_5000/.
+# Files are saved directly under chris_jit_origin_plan_promo_usage1_quick_validation_5000/.
 #
 # rolling_joint_h3_test = run_joint_h3_s3_rolling_scot_p50_p70(
 #     n_asins=5000,
@@ -4906,7 +4841,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="chris_jit_cut_local_usage1_quick_validation_5000",
+#     output_root="chris_jit_origin_plan_promo_usage1_quick_validation_5000",
 #     resume_existing=True,
 #     continue_on_error=False,
 # )
@@ -4920,7 +4855,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 # that fully joined eligible cohort.
 #
 # Each completed cut writes one date-stamped CSV directly under
-# chris_jit_cut_local_usage2_full_rolling_15000/, for example:
+# chris_jit_origin_plan_promo_usage2_full_rolling_15000/, for example:
 #   chris_jit_prediction_cut_2025-10-04_<cohort_tag>.csv
 #
 # Each file contains:
@@ -4941,7 +4876,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="chris_jit_cut_local_usage2_full_rolling_15000",
+#     output_root="chris_jit_origin_plan_promo_usage2_full_rolling_15000",
 #     resume_existing=True,
 #     continue_on_error=True,
 # )
@@ -4953,7 +4888,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 # Setting n_asins=None disables sampling. Every cut uses the complete
 # origin/evaluation/SCOT/Chris/JIT intersection. Use a separate output_root so
 # resume files remain isolated from sampled runs. Date-stamped CSV files
-# are saved directly under chris_jit_cut_local_usage3_full_rolling_all_asins/.
+# are saved directly under chris_jit_origin_plan_promo_usage3_full_rolling_all_asins/.
 #
 # rolling_joint_h3_all_asins = run_joint_h3_s3_rolling_scot_p50_p70(
 #     n_asins=None,
@@ -4967,7 +4902,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="chris_jit_cut_local_usage3_full_rolling_all_asins",
+#     output_root="chris_jit_origin_plan_promo_usage3_full_rolling_all_asins",
 #     resume_existing=True,
 #     continue_on_error=True,
 # )
