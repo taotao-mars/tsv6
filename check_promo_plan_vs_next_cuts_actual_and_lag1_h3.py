@@ -53,7 +53,6 @@ Main outputs
 
 from __future__ import annotations
 
-import argparse
 import io
 import re
 from pathlib import Path
@@ -563,68 +562,51 @@ def missingness_summary(detail: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Compare origin H1-H3 plan values and lag1 baseline against "
-            "realized values from the next three cuts."
-        )
-    )
-    parser.add_argument("--bucket", default=DEFAULT_BUCKET)
-    parser.add_argument("--data-prefix", default=DEFAULT_DATA_PREFIX)
-    parser.add_argument("--start-date", default=None)
-    parser.add_argument("--end-date", default=None)
-    parser.add_argument("--max-cuts", type=int, default=None)
-    parser.add_argument(
-        "--latest",
-        action="store_true",
-        help="With --max-cuts, select the latest origins.",
-    )
-    parser.add_argument(
-        "--chris-csv",
-        default="asin_list_from_amxl_fcst_scot_to_chris_20260723.csv",
-        help="Chris cohort CSV containing an asin column.",
-    )
-    parser.add_argument(
-        "--jit-csv",
-        default="jit_asin_list_from_Hrishi_20270727.csv",
-        help="JIT cohort CSV containing an asin column.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default="joint_chris_jit_promo_plan_vs_actual_and_lag1_h3",
-    )
-    return parser.parse_args()
+# ================================================================
+# NOTEBOOK CONFIG — edit only this block, then run the whole cell
+# ================================================================
+BUCKET = DEFAULT_BUCKET
+DATA_PREFIX = DEFAULT_DATA_PREFIX
+
+CHRIS_CSV = "asin_list_from_amxl_fcst_scot_to_chris_20260723.csv"
+JIT_CSV = "jit_asin_list_from_Hrishi_20270727.csv"
+
+# Optional origin-cut filters. Keep None to use all available cuts.
+START_DATE = None          # example: "2026-01-01"
+END_DATE = None            # example: "2026-07-31"
+MAX_CUTS = None            # example: 5
+USE_LATEST_CUTS = True     # used only when MAX_CUTS is not None
+
+OUTPUT_DIR = "joint_chris_jit_promo_plan_vs_actual_and_lag1_h3"
 
 
-def main() -> None:
-    args = parse_args()
-    output_dir = Path(args.output_dir)
+def run_notebook_analysis():
+    output_dir = Path(OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     s3_client = boto3.client("s3")
     cuts = list_snapshot_cuts(
-        bucket=args.bucket,
-        data_prefix=args.data_prefix,
+        bucket=BUCKET,
+        data_prefix=DATA_PREFIX,
         s3_client=s3_client,
     )
     pairs = build_origin_next_cut_pairs(cuts)
 
-    if args.start_date:
+    if START_DATE:
         pairs = pairs[
-            pairs["data_cut"] >= pd.Timestamp(args.start_date).normalize()
+            pairs["data_cut"] >= pd.Timestamp(START_DATE).normalize()
         ]
-    if args.end_date:
+    if END_DATE:
         pairs = pairs[
-            pairs["data_cut"] <= pd.Timestamp(args.end_date).normalize()
+            pairs["data_cut"] <= pd.Timestamp(END_DATE).normalize()
         ]
 
     pairs = pairs.sort_values("data_cut")
-    if args.max_cuts is not None:
+    if MAX_CUTS is not None:
         pairs = (
-            pairs.tail(args.max_cuts)
-            if args.latest
-            else pairs.head(args.max_cuts)
+            pairs.tail(MAX_CUTS)
+            if USE_LATEST_CUTS
+            else pairs.head(MAX_CUTS)
         )
 
     if pairs.empty:
@@ -632,16 +614,15 @@ def main() -> None:
             "No origin cuts with three later snapshots were found."
         )
 
-    chris_set = _load_optional_cohort(args.chris_csv)
+    chris_set = _load_optional_cohort(CHRIS_CSV)
     jit_set = _load_optional_cohort(
-        args.jit_csv,
+        JIT_CSV,
         excluded_asins={"B01FV0F13E", "B073H7VJ37"},
     )
 
     if chris_set is None or jit_set is None:
         raise RuntimeError(
-            "This diagnostic is joint-only and requires both Chris and JIT "
-            "cohort CSV files."
+            "Both Chris and JIT cohort CSV files are required."
         )
 
     joint_set = chris_set & jit_set
@@ -680,26 +661,26 @@ def main() -> None:
         )
 
         origin_raw = _read_s3_csv_columns(
-            args.bucket,
+            BUCKET,
             row["origin_key"],
             read_columns,
             s3_client,
         )
         actual_raw_by_horizon = {
             1: _read_s3_csv_columns(
-                args.bucket,
+                BUCKET,
                 row["h1_actual_key"],
                 read_columns,
                 s3_client,
             ),
             2: _read_s3_csv_columns(
-                args.bucket,
+                BUCKET,
                 row["h2_actual_key"],
                 read_columns,
                 s3_client,
             ),
             3: _read_s3_csv_columns(
-                args.bucket,
+                BUCKET,
                 row["h3_actual_key"],
                 read_columns,
                 s3_client,
@@ -760,6 +741,24 @@ def main() -> None:
     for path in paths.values():
         print(f"  {path}")
 
+    return {
+        "detail": detail,
+        "by_cut_horizon": by_cut_horizon,
+        "overall": overall,
+        "by_asin": by_asin,
+        "missing": missing,
+        "paths": paths,
+    }
 
-if __name__ == "__main__":
-    main()
+
+# Run immediately when this notebook cell is executed.
+results = run_notebook_analysis()
+
+# Convenient notebook variables for inspection.
+detail_df = results["detail"]
+overall_df = results["overall"]
+by_cut_horizon_df = results["by_cut_horizon"]
+by_asin_df = results["by_asin"]
+missing_df = results["missing"]
+
+display(overall_df)
