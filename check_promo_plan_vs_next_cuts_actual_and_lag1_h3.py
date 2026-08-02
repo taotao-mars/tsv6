@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Standalone diagnostic for three promotion/pricing fields.
+Standalone Chris ∩ JIT joint-cohort diagnostic for three promotion/pricing fields.
 
 Goal
 ----
@@ -420,6 +420,7 @@ def compare_one_origin(
     ).drop(columns=["order_week"], errors="ignore")
 
     detail.insert(0, "data_cut", data_cut)
+    detail.insert(1, "cohort", "CHRIS_JIT_JOINT")
 
     for estimate in ["plan", "lag1"]:
         _numeric_errors(detail, estimate, "ind_promotion")
@@ -581,17 +582,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--chris-csv",
-        default=None,
-        help="Optional Chris cohort CSV containing an asin column.",
+        default="asin_list_from_amxl_fcst_scot_to_chris_20260723.csv",
+        help="Chris cohort CSV containing an asin column.",
     )
     parser.add_argument(
         "--jit-csv",
-        default=None,
-        help="Optional JIT cohort CSV containing an asin column.",
+        default="jit_asin_list_from_Hrishi_20270727.csv",
+        help="JIT cohort CSV containing an asin column.",
     )
     parser.add_argument(
         "--output-dir",
-        default="promo_plan_vs_next_cuts_actual_and_lag1_h3",
+        default="joint_chris_jit_promo_plan_vs_actual_and_lag1_h3",
     )
     return parser.parse_args()
 
@@ -637,11 +638,26 @@ def main() -> None:
         excluded_asins={"B01FV0F13E", "B073H7VJ37"},
     )
 
+    if chris_set is None or jit_set is None:
+        raise RuntimeError(
+            "This diagnostic is joint-only and requires both Chris and JIT "
+            "cohort CSV files."
+        )
+
+    joint_set = chris_set & jit_set
+    if not joint_set:
+        raise RuntimeError("Chris ∩ JIT cohort is empty.")
+
+    print(
+        f"Joint cohort loaded: Chris={len(chris_set):,} | "
+        f"JIT={len(jit_set):,} | intersection={len(joint_set):,}"
+    )
+
     read_columns = ["asin", "order_week", *PROMO_FIELDS]
     all_detail = []
 
     print("=" * 96)
-    print("ORIGIN PLAN VS NEXT-CUT ACTUAL VS LAG1")
+    print("CHRIS ∩ JIT JOINT: ORIGIN PLAN VS NEXT-CUT ACTUAL VS LAG1")
     print("=" * 96)
     print(f"Origins selected: {len(pairs)}")
     print(f"Output directory: {output_dir.resolve()}")
