@@ -18,6 +18,7 @@ The rolling pipeline prepares their required columns without changing the scorin
 """
 
 import os
+import hashlib
 import time
 import multiprocessing as mp
 import random
@@ -31,6 +32,12 @@ from sklearn.metrics import roc_auc_score
 
 torch.manual_seed(42)
 np.random.seed(42)
+
+print(
+    "[VERSION] v3 CHRIS-JIT | promotion future features removed | "
+    "history-only preprocessing | no extreme-ASIN filter | isolated outputs",
+    flush=True,
+)
 
 
 # =============================================================================
@@ -413,15 +420,21 @@ def _evaluate_standard_wape_against_scot(
     return outputs
 
 # =====================================================
-# Chris ASIN cohort — loaded once for the whole rolling run
+# Chris ∩ JIT ASIN cohort — loaded once for the rolling run
 # =====================================================
 CHRIS_DF_PATH = "asin_list_from_amxl_fcst_scot_to_chris_20260723.csv"
+JIT_DF_PATH = "jit_asin_list_from_Hrishi_20270727.csv"
+JIT_EXCLUDED_ASINS = {"B01FV0F13E", "B073H7VJ37"}
 
-if not os.path.exists(CHRIS_DF_PATH):
-    raise FileNotFoundError(
-        f"Chris ASIN cohort file not found: {CHRIS_DF_PATH}. "
-        "Place the CSV in the current working directory."
-    )
+for cohort_name, cohort_path in [
+    ("Chris", CHRIS_DF_PATH),
+    ("JIT", JIT_DF_PATH),
+]:
+    if not os.path.exists(cohort_path):
+        raise FileNotFoundError(
+            f"{cohort_name} ASIN cohort file not found: {cohort_path}. "
+            "Place the CSV in the current working directory."
+        )
 
 _chris_df = pd.read_csv(CHRIS_DF_PATH, usecols=["asin"])
 CHRIS_ASIN_SET = set(
@@ -433,11 +446,23 @@ CHRIS_ASIN_SET = set(
 )
 del _chris_df
 
+_jit_df = pd.read_csv(JIT_DF_PATH, usecols=["asin"])
+_jit_asin = _jit_df["asin"].dropna().astype(str).str.strip()
+JIT_ASIN_SET = set(_jit_asin[~_jit_asin.isin(JIT_EXCLUDED_ASINS)].unique())
+del _jit_df, _jit_asin
+
+CHRIS_JIT_ASIN_SET = CHRIS_ASIN_SET & JIT_ASIN_SET
+
 print(
-    f"[CHRIS-BASELINE] loaded {len(CHRIS_ASIN_SET):,} unique ASINs "
-    f"from {CHRIS_DF_PATH}",
+    f"[CHRIS-JIT] Chris={len(CHRIS_ASIN_SET):,} | "
+    f"JIT={len(JIT_ASIN_SET):,} | "
+    f"intersection={len(CHRIS_JIT_ASIN_SET):,} | "
+    f"JIT exclusions={sorted(JIT_EXCLUDED_ASINS)}",
     flush=True,
 )
+
+if not CHRIS_JIT_ASIN_SET:
+    raise RuntimeError("Chris and JIT ASIN cohorts have an empty intersection.")
 
 # =====================================================
 # GPU / device
@@ -634,82 +659,103 @@ def _apply_dph_cap(df, cap):
 
 def _select_stock_decoder_extra_cols(data_raw):
     """
-    Select additional features to help the external exposure covariates.
+    Select the three promotion/pricing fields as historical-origin context.
 
-    These are NOT true future in_stock_dph. They are product / popularity / price / promo
-    / package features that can help predict future exposure.
+    Important:
+      - Their H1-H3 target-week values are never used.
+      - Preprocessing is fitted on rows at or before the forecast origin.
+      - For every sample, the latest value observable at the forecast origin
+        is repeated across H1-H3.
 
-    We keep a conservative list to avoid leakage-prone realized future outcomes.
+    This preserves historical promotion information without giving the model
+    future realized promotion or pricing values.
     """
-    # Top-3 ablation choice for the external exposure / in-stock decoder.
-    # These are the only additional stock_extra__ features added to future_context.
     candidate_cols = [
         "ind_promotion",
         "promotion_pricing_amount",
         "pricing_type",
     ]
-
-    # Avoid realized target / future outcome columns.
-    exclude_cols = {
-        "fbi_demand",
-        "order_units",
-        "scot_oos",
-        "in_stock_dph",
-        "asin",
-        "order_week",
-    }
-
-    cols = [
-        c for c in candidate_cols
-        if c in data_raw.columns and c not in exclude_cols
-    ]
-
-    return cols
+    return [c for c in candidate_cols if c in data_raw.columns]
 
 
-def _encode_stock_decoder_extra_features(df, extra_cols):
-    """Encode the three fixed stock-decoder context fields."""
+def _encode_stock_decoder_extra_features(
+    df,
+    extra_cols,
+    fit_end_week=None,
+    week_col="order_week",
+):
+    """
+    Fit stock-extra preprocessing on history only, then transform all rows.
+
+    In this version `extra_cols` is intentionally empty because the three
+    promotion fields were removed. The history-only implementation is retained
+    so future safe, forecast-origin-known covariates cannot accidentally fit
+    scalers or category mappings on H1-H3/evaluation rows.
+    """
     out_cols = []
+    if not extra_cols:
+        return df, out_cols
+
+    if week_col not in df.columns:
+        raise ValueError(
+            f"History-only stock-extra encoding requires {week_col!r}."
+        )
+
+    weeks = pd.to_datetime(df[week_col], errors="coerce")
+    if fit_end_week is None:
+        fit_mask = pd.Series(True, index=df.index)
+        fit_desc = "all supplied rows"
+    else:
+        fit_end_week = pd.Timestamp(fit_end_week)
+        fit_mask = weeks <= fit_end_week
+        fit_desc = f"{week_col} <= {fit_end_week.date()}"
+
+    if not bool(fit_mask.any()):
+        raise ValueError(
+            "No rows are available to fit stock-extra preprocessing using "
+            f"{fit_desc}."
+        )
 
     for c in extra_cols:
         if c not in df.columns:
             continue
 
         new_c = f"stock_extra__{c}"
-        raw = _get_1d_col(df, c)
+        raw_all = _get_1d_col(df, c)
+        raw_fit = raw_all.loc[fit_mask]
 
-        if c == "ind_promotion":
-            val = pd.to_numeric(raw, errors="coerce").fillna(0.0)
-            std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
-            mean = float(val.mean())
-            df[new_c] = ((val - mean) / std).clip(-5, 5)
+        if pd.api.types.is_numeric_dtype(raw_all):
+            val_all = pd.to_numeric(raw_all, errors="coerce").fillna(0.0)
+            val_fit = pd.to_numeric(raw_fit, errors="coerce").fillna(0.0)
 
-        elif c == "promotion_pricing_amount":
-            val = pd.to_numeric(raw, errors="coerce").fillna(0.0)
-            val = np.log1p(val.clip(lower=0))
-            std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
-            mean = float(val.mean())
-            df[new_c] = ((val - mean) / std).clip(-5, 5)
+            if c in {"promotion_pricing_amount", "pricing_type"}:
+                val_all = np.log1p(val_all.clip(lower=0))
+                val_fit = np.log1p(val_fit.clip(lower=0))
 
-        elif c == "pricing_type":
-            if pd.api.types.is_numeric_dtype(df[c]):
-                val = pd.to_numeric(raw, errors="coerce").fillna(0.0)
-                val = np.log1p(val.clip(lower=0))
-                std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
-                mean = float(val.mean())
-                df[new_c] = ((val - mean) / std).clip(-5, 5)
-            else:
-                codes, uniques = pd.factorize(raw.astype(str).fillna("MISSING"))
-                denom = max(len(uniques) - 1, 1)
-                df[new_c] = codes.astype(float) / denom
+            mean = float(val_fit.mean())
+            fit_std = float(val_fit.std())
+            std = fit_std if np.isfinite(fit_std) and fit_std > 1e-8 else 1.0
+            df[new_c] = ((val_all - mean) / std).clip(-5, 5)
 
         else:
-            raise ValueError(f"Unexpected stock decoder feature: {c}")
+            fit_values = (
+                raw_fit.fillna("MISSING").astype(str).drop_duplicates().tolist()
+            )
+            mapping = {value: i + 1 for i, value in enumerate(sorted(fit_values))}
+            codes = (
+                raw_all.fillna("MISSING").astype(str).map(mapping).fillna(0)
+            )
+            denom = max(len(mapping), 1)
+            df[new_c] = codes.astype(float) / denom
 
         out_cols.append(new_c)
 
+    print(
+        f"[STOCK-EXTRA] fitted on {fit_desc} | "
+        f"rows={int(fit_mask.sum()):,} | output_cols={out_cols}",
+        flush=True,
+    )
     return df, out_cols
-
 
 
 def _safe_numeric(df, col, default=0.0):
@@ -784,9 +830,16 @@ def _zero_streak(active):
 _MP_LOAD_FEATURE_DF = None
 _MP_LOAD_CONTEXT_COLS = None
 _MP_LOAD_DPH_PROXY_COLS = None
+_MP_LOAD_STOCK_EXTRA_COLS = None
 
 
-def _build_one_asin_feature_record(asin, group, context_cols, dph_proxy_cols):
+def _build_one_asin_feature_record(
+    asin,
+    group,
+    context_cols,
+    dph_proxy_cols,
+    stock_extra_cols,
+):
     """Build one ASIN record with the same feature logic as the serial version."""
     # The parent DataFrame is already sorted by ASIN and Week. A group slice has a
     # fresh positional index only when needed; most operations use NumPy directly.
@@ -892,13 +945,16 @@ def _build_one_asin_feature_record(asin, group, context_cols, dph_proxy_cols):
         "dph_proxy_context_idx": {
             c: context_cols.index(c) for c in dph_proxy_cols if c in context_cols
         },
+        "stock_extra_context_idx": {
+            c: context_cols.index(c) for c in stock_extra_cols if c in context_cols
+        },
     }
 
 
 def _mp_load_feature_chunk_worker(task):
     """Process one contiguous ASIN-aligned row chunk inherited through fork."""
     worker_id, row_start, row_end, expected_asins = task
-    global _MP_LOAD_FEATURE_DF, _MP_LOAD_CONTEXT_COLS, _MP_LOAD_DPH_PROXY_COLS
+    global _MP_LOAD_FEATURE_DF, _MP_LOAD_CONTEXT_COLS, _MP_LOAD_DPH_PROXY_COLS, _MP_LOAD_STOCK_EXTRA_COLS
     t0 = time.perf_counter()
     print(
         f"[LOAD-W{worker_id}] START | rows={row_end-row_start:,} | "
@@ -909,7 +965,11 @@ def _mp_load_feature_chunk_worker(task):
     out = {}
     for i, (asin, group) in enumerate(chunk.groupby("ASIN", sort=False), start=1):
         asin_key, record = _build_one_asin_feature_record(
-            asin, group, _MP_LOAD_CONTEXT_COLS, _MP_LOAD_DPH_PROXY_COLS
+            asin,
+            group,
+            _MP_LOAD_CONTEXT_COLS,
+            _MP_LOAD_DPH_PROXY_COLS,
+            _MP_LOAD_STOCK_EXTRA_COLS,
         )
         out[asin_key] = record
         if i == 1 or i % 1000 == 0 or i == expected_asins:
@@ -929,7 +989,12 @@ def _mp_load_feature_chunk_worker(task):
     )
     return worker_id, out
 
-def load_real_data(data_raw, dph_cap_q=0.995, dph_cap_end_week=None):
+def load_real_data(
+    data_raw,
+    dph_cap_q=0.995,
+    dph_cap_end_week=None,
+    stock_extra_fit_end_week=None,
+):
     _stage_t0 = time.perf_counter()
     print(f"[STAGE] load_real_data START | rows={len(data_raw):,} | asins={data_raw['asin'].nunique() if 'asin' in data_raw.columns else 'NA'}", flush=True)
     """
@@ -1050,11 +1115,16 @@ def load_real_data(data_raw, dph_cap_q=0.995, dph_cap_end_week=None):
 
     df = data_raw[keep_cols].copy()
 
-    # Encode additional product / popularity / promo / size features for stock decoder.
-    df, stock_extra_cols = _encode_stock_decoder_extra_features(df, stock_extra_raw_cols)
+    # Encode promotion/pricing fields using history-only fitted transforms.
+    df, stock_extra_cols = _encode_stock_decoder_extra_features(
+        df,
+        stock_extra_raw_cols,
+        fit_end_week=stock_extra_fit_end_week,
+        week_col="order_week",
+    )
 
-    # Add encoded stock-extra columns to future_context.
-    # These features help the external exposure covariates.
+    # Add the encoded promotion/pricing columns to context; target-week values
+    # are overwritten inside DemandDataset with the latest origin value.
     context_cols = context_cols + stock_extra_cols
 
     # Forecast-origin-safe historical DPH proxy features.
@@ -1198,10 +1268,11 @@ def load_real_data(data_raw, dph_cap_q=0.995, dph_cap_end_week=None):
                 raise RuntimeError(
                     "spawn start method would pickle the full DataFrame; using serial fallback"
                 )
-            global _MP_LOAD_FEATURE_DF, _MP_LOAD_CONTEXT_COLS, _MP_LOAD_DPH_PROXY_COLS
+            global _MP_LOAD_FEATURE_DF, _MP_LOAD_CONTEXT_COLS, _MP_LOAD_DPH_PROXY_COLS, _MP_LOAD_STOCK_EXTRA_COLS
             _MP_LOAD_FEATURE_DF = df
             _MP_LOAD_CONTEXT_COLS = context_cols
             _MP_LOAD_DPH_PROXY_COLS = dph_proxy_cols
+            _MP_LOAD_STOCK_EXTRA_COLS = stock_extra_cols
             print(
                 f"[LOAD] launching {len(_tasks)} fork workers...",
                 flush=True,
@@ -1239,12 +1310,17 @@ def load_real_data(data_raw, dph_cap_q=0.995, dph_cap_end_week=None):
             _MP_LOAD_FEATURE_DF = None
             _MP_LOAD_CONTEXT_COLS = None
             _MP_LOAD_DPH_PROXY_COLS = None
+            _MP_LOAD_STOCK_EXTRA_COLS = None
 
     if not _used_parallel:
         _serial_t0 = time.perf_counter()
         for _asin_i, (asin, group) in enumerate(df.groupby("ASIN", sort=False), start=1):
             asin_key, record = _build_one_asin_feature_record(
-                asin, group, context_cols, dph_proxy_cols
+                asin,
+                group,
+                context_cols,
+                dph_proxy_cols,
+                stock_extra_cols,
             )
             data[asin_key] = record
             if _asin_i == 1 or _asin_i % 2000 == 0 or _asin_i == _n_asins:
@@ -1382,6 +1458,17 @@ class DemandDataset(Dataset):
             fill("hist_instock_dph_last_log", instock_last)
             fill("hist_instock_dph_mean4_log", self._safe_hist_mean(instock_hist, start, history, 4))
             fill("hist_instock_dph_mean13_log", self._safe_hist_mean(instock_hist, start, history, 13))
+
+        # Historical promotion/pricing context:
+        # use only the latest encoded value observable at the forecast origin,
+        # then repeat it across H1-H3. Never read the target-week values for
+        # stock_extra__ind_promotion, stock_extra__promotion_pricing_amount,
+        # or stock_extra__pricing_type.
+        origin_idx = start + history - 1
+        stock_idx = d.get("stock_extra_context_idx", {})
+        if origin_idx >= 0 and origin_idx < len(d["future_context"]):
+            for _, col_idx in stock_idx.items():
+                fc[:, col_idx] = d["future_context"][origin_idx, col_idx]
 
         return fc
 
@@ -2000,7 +2087,12 @@ def filter_extreme_asins(data_high, demand_col="fbi_demand", asin_col="asin", q=
 _ORIGINAL_LOAD_REAL_DATA_BEFORE_EXTERNAL_EXP3 = load_real_data
 
 
-def load_real_data(data_raw, dph_cap_q=0.995, dph_cap_end_week=None):
+def load_real_data(
+    data_raw,
+    dph_cap_q=0.995,
+    dph_cap_end_week=None,
+    stock_extra_fit_end_week=None,
+):
     """
     Override original load_real_data to inject external exposure-3 hats into future_context.
 
@@ -2019,6 +2111,7 @@ def load_real_data(data_raw, dph_cap_q=0.995, dph_cap_end_week=None):
         data_raw=data_raw,
         dph_cap_q=dph_cap_q,
         dph_cap_end_week=dph_cap_end_week,
+        stock_extra_fit_end_week=stock_extra_fit_end_week,
     )
 
     print(
@@ -2580,7 +2673,12 @@ EXTERNAL_HAT_COLS = [
 ]
 
 
-def load_real_data(data_raw, dph_cap_q=0.995, dph_cap_end_week=None):
+def load_real_data(
+    data_raw,
+    dph_cap_q=0.995,
+    dph_cap_end_week=None,
+    stock_extra_fit_end_week=None,
+):
     _wrapper_t0 = time.perf_counter()
     print("[PROFILE-WRAPPER 01] graph-context wrapper ENTERED", flush=True)
     print(
@@ -2594,6 +2692,7 @@ def load_real_data(data_raw, dph_cap_q=0.995, dph_cap_end_week=None):
         data_raw,
         dph_cap_q=dph_cap_q,
         dph_cap_end_week=dph_cap_end_week,
+        stock_extra_fit_end_week=stock_extra_fit_end_week,
     )
 
     print(
@@ -3297,17 +3396,23 @@ def run_joint_exposure_demand_h3_end2end(
     lambda_over=0.0,
     lambda_exposure=0.50,
     detach_exposure_for_demand=False,
-    remove_extreme=True,
-    extreme_q=0.99,
+    remove_extreme=False,
+    extreme_q=None,
     output_csv="joint_exposure_demand_h3_forecast_two_step_wape_aligned.csv",
     remove_oos_dp=True,
     dph_cap_end_week=None,
+    stock_extra_fit_end_week=None,
 ):
     """Run non-rolling H3 joint model on one snapshot.
 
     V1 keeps the existing demand preprocessing and SCOT cohort logic, but it no
     longer reads an exposure CSV. Future exposure is predicted internally.
     """
+    # Cohort policy: retain all eligible Chris ∩ JIT ASINs. The legacy
+    # 99th-percentile extreme-demand ASIN filter is disabled.
+    remove_extreme = False
+    extreme_q = None
+
     if horizon != 3:
         raise ValueError("Use horizon=3 for this file.")
 
@@ -3378,6 +3483,7 @@ def run_joint_exposure_demand_h3_end2end(
         data_use,
         dph_cap_q=0.995,
         dph_cap_end_week=dph_cap_end_week,
+        stock_extra_fit_end_week=stock_extra_fit_end_week,
     )
     print(
         f"[STAGE] load_real_data RETURNED | built_asins={len(data):,} | "
@@ -4013,10 +4119,10 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     lambda_over=0.0,
     lambda_exposure=0.50,
     detach_exposure_for_demand=False,
-    remove_extreme=True,
-    extreme_q=0.99,
+    remove_extreme=False,
+    extreme_q=None,
     remove_oos_dp=True,
-    output_root="joint_true_rolling_h3_original_wape_exposure_diag",
+    output_root="chris_jit_historical_promo_rolling_h3_outputs",
     resume_existing=True,
     continue_on_error=True,
     bucket=ROLLING_S3_BUCKET,
@@ -4029,7 +4135,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     For every matched cut:
       1. Read one feature snapshot CSV.
       2. Read the SCOT parquet whose FCD is snapshot date + 1 day.
-      3. Intersect origin, evaluation, SCOT, and Chris ASIN cohorts.
+      3. Intersect origin, evaluation, SCOT, Chris, and JIT ASIN cohorts.
       4. Randomly sample n_asins from that fully joined cohort.
       5. Train the unchanged Joint H3 V1.2 model.
       6. Evaluate P50, P70, and P90 with the existing standardized WAPE pipeline.
@@ -4038,6 +4144,11 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     CSV export does not change model training, inference, or WAPE calculations.
     Model architecture and losses are unchanged from the non-rolling V1.2 file.
     """
+    # Keep every eligible Chris ∩ JIT ASIN; do not apply the legacy
+    # 99th-percentile demand-based ASIN removal.
+    remove_extreme = False
+    extreme_q = None
+
     if horizon != 3:
         raise ValueError("This rolling experiment is H3 only.")
 
@@ -4121,7 +4232,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 
         # SageMaker/JupyterLab-friendly layout: keep all rolling outputs in
         # one existing root directory and distinguish cuts by filename.
-        prediction_path = output_root / f"prediction_cut_{cut_token}.csv"
+        prediction_path = output_root / f"_pending_chris_jit_cut_{cut_token}.csv"
 
         print("\n" + "#" * 100)
         print(
@@ -4162,27 +4273,28 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             )
 
             # Build the fully joined eligible cohort FIRST:
-            # origin snapshot ∩ evaluation snapshot ∩ SCOT ∩ Chris.
+            # origin snapshot ∩ evaluation snapshot ∩ SCOT ∩ Chris ∩ JIT.
             # Only after that intersection do we apply n_asins sampling.
             origin_set = set(origin_raw["asin"].dropna().unique())
             scot_set = set(scot_df["asin"].dropna().unique())
             eval_set = set(eval_raw["asin"].dropna().unique())
             eligible_joint_asins = sorted(
-                origin_set & scot_set & eval_set & CHRIS_ASIN_SET
+                origin_set & scot_set & eval_set & CHRIS_ASIN_SET & JIT_ASIN_SET
             )
 
             print(
-                f"[CHRIS-JOINT] eligible before sampling | "
+                f"[CHRIS-JIT-JOINT] eligible before sampling | "
                 f"origin={len(origin_set):,} | scot={len(scot_set):,} | "
                 f"eval={len(eval_set):,} | chris={len(CHRIS_ASIN_SET):,} | "
+                f"jit={len(JIT_ASIN_SET):,} | "
                 f"joint={len(eligible_joint_asins):,}",
                 flush=True,
             )
 
             if not eligible_joint_asins:
                 raise RuntimeError(
-                    "No ASINs remain after origin, evaluation, SCOT, and "
-                    "Chris intersection."
+                    "No ASINs remain after origin, evaluation, SCOT, Chris, and "
+                    "JIT intersection."
                 )
 
             if n_asins is None:
@@ -4198,17 +4310,25 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 )
 
             print(
-                f"[CHRIS-JOINT] after n_asins sampling | "
+                f"[CHRIS-JIT-JOINT] after n_asins sampling | "
                 f"requested={'ALL' if n_asins is None else int(n_asins):} | "
                 f"selected={len(rolling_asins):,}",
                 flush=True,
             )
 
-            # Store every rolling cut directly under output_root. The cut date
-            # is part of the filename, so no per-cut subdirectory is required.
-            prediction_path = output_root / f"prediction_cut_{cut_token}.csv"
+            # Use an isolated Chris-JIT cache namespace. Including the selected
+            # cohort hash prevents a different n_asins/seed/cohort run from
+            # loading or overwriting another run for the same rolling cut.
+            cohort_hash = hashlib.sha1(
+                "\n".join(rolling_asins).encode("utf-8")
+            ).hexdigest()[:12]
+            cohort_tag = f"n{len(rolling_asins)}_seed{seed}_{cohort_hash}"
+            prediction_path = output_root / (
+                f"chris_jit_prediction_cut_{cut_token}_{cohort_tag}.csv"
+            )
             print(
-                f"[ROLLING-OUTPUT] prediction={prediction_path}",
+                f"[ROLLING-OUTPUT] cohort_tag={cohort_tag} | "
+                f"prediction={prediction_path}",
                 flush=True,
             )
 
@@ -4415,6 +4535,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                     output_csv=str(prediction_path),
                     remove_oos_dp=remove_oos_dp,
                     dph_cap_end_week=dph_cap_end_week,
+                    stock_extra_fit_end_week=dph_cap_end_week,
                 )
 
                 if "real_scot_outputs" not in result:
@@ -4690,7 +4811,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 # ============================================================================
 # Use this small run to verify S3 loading, cohort construction, eager dataset
 # creation, training, WAPE evaluation, and per-cut CSV export.
-# Files are saved directly under joint_h3_usage1_quick_validation_5000/.
+# Files are saved directly under chris_jit_historical_promo_usage1_quick_validation_5000/.
 #
 # rolling_joint_h3_test = run_joint_h3_s3_rolling_scot_p50_p70(
 #     n_asins=5000,
@@ -4704,7 +4825,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_h3_usage1_quick_validation_5000",
+#     output_root="chris_jit_historical_promo_usage1_quick_validation_5000",
 #     resume_existing=True,
 #     continue_on_error=False,
 # )
@@ -4714,12 +4835,12 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 # USAGE 2 OF 3: FULL ROLLING RUN WITH A FIXED SAMPLE SIZE
 # ============================================================================
 # For each cut, the code first intersects the origin snapshot, evaluation
-# snapshot, SCOT cohort, and Chris cohort. It then samples up to n_asins from
+# snapshot, SCOT cohort, Chris cohort, and JIT cohort. It then samples up to n_asins from
 # that fully joined eligible cohort.
 #
 # Each completed cut writes one date-stamped CSV directly under
-# joint_h3_usage2_full_rolling_15000/, for example:
-#   prediction_cut_2025-10-04.csv
+# chris_jit_historical_promo_usage2_full_rolling_15000/, for example:
+#   chris_jit_prediction_cut_2025-10-04_<cohort_tag>.csv
 #
 # Each file contains:
 #   - ASIN, order week, and forecast horizon
@@ -4739,7 +4860,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_h3_usage2_full_rolling_15000",
+#     output_root="chris_jit_historical_promo_usage2_full_rolling_15000",
 #     resume_existing=True,
 #     continue_on_error=True,
 # )
@@ -4749,9 +4870,9 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 # USAGE 3 OF 3: FULL ROLLING RUN WITH ALL ELIGIBLE ASINS
 # ============================================================================
 # Setting n_asins=None disables sampling. Every cut uses the complete
-# origin/evaluation/SCOT/Chris intersection. Use a separate output_root so
+# origin/evaluation/SCOT/Chris/JIT intersection. Use a separate output_root so
 # resume files remain isolated from sampled runs. Date-stamped CSV files
-# are saved directly under joint_h3_usage3_full_rolling_all_asins/.
+# are saved directly under chris_jit_historical_promo_usage3_full_rolling_all_asins/.
 #
 # rolling_joint_h3_all_asins = run_joint_h3_s3_rolling_scot_p50_p70(
 #     n_asins=None,
@@ -4765,7 +4886,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #     batch_size=64,
 #     lambda_exposure=0.50,
 #     detach_exposure_for_demand=False,
-#     output_root="joint_h3_usage3_full_rolling_all_asins",
+#     output_root="chris_jit_historical_promo_usage3_full_rolling_all_asins",
 #     resume_existing=True,
 #     continue_on_error=True,
 # )
