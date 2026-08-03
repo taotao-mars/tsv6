@@ -108,7 +108,7 @@ def build_last3_origin_pairs(cuts):
     pairs = pd.DataFrame(rows)
     if pairs.empty:
         raise RuntimeError("Not enough snapshots to form 3 future cuts.")
-    return pairs.sort_values("data_cut").tail(MAX_CUTS).reset_index(drop=True)
+    return pairs.sort_values("data_cut").reset_index(drop=True)
 
 
 def read_s3_csv_columns(bucket, key, wanted_columns, s3):
@@ -279,11 +279,14 @@ def make_detail_for_cut(
     future_order_weeks = [w for w in distinct_weeks if w > current_order_week]
 
     if len(future_order_weeks) < 3:
-        raise RuntimeError(
-            f"Origin cut {data_cut.date()} has current_order_week="
-            f"{current_order_week.date()} but only {len(future_order_weeks)} "
-            "future order_week values; need at least 3."
-        )
+        return None, {
+            "skip_reason": (
+                f"current_order_week={current_order_week.date()} has only "
+                f"{len(future_order_weeks)} future order_week values"
+            ),
+            "current_order_week": current_order_week,
+            "future_week_count": len(future_order_weeks),
+        }
 
     target_week_by_h = {
         1: future_order_weeks[0],
@@ -673,7 +676,7 @@ def run_analysis():
         f"JIT(after exclusions)={len(jit_set):,} | "
         f"Chris∩JIT={len(chris_set & jit_set):,}"
     )
-    print("Only latest 3 origin cuts. Nothing will be saved.")
+    print("Use the latest 3 VALID origin cuts. Cuts without complete H1/H2/H3 plan weeks are skipped. Nothing will be saved.")
 
     read_columns = [
         "asin",
@@ -683,8 +686,14 @@ def run_analysis():
     ]
 
     all_detail = []
+    valid_cut_results = []
 
-    for cut_i, row in pairs.iterrows():
+    # Scan from newest to oldest. A cut is accepted only when its origin
+    # snapshot contains current week + complete H1/H2/H3 future plan weeks.
+    for _, row in pairs.sort_values("data_cut", ascending=False).iterrows():
+        if len(valid_cut_results) >= MAX_CUTS:
+            break
+
         data_cut = pd.Timestamp(row["data_cut"])
         actual_cut_by_h = {
             1: pd.Timestamp(row["h1_cut"]),
@@ -712,7 +721,17 @@ def run_analysis():
             jit_set=jit_set,
         )
 
+        if detail is None:
+            print(
+                f"[SKIP] origin cut {data_cut.date()} skipped: "
+                f"{cohort_info.get('skip_reason', 'insufficient H1/H2/H3 weeks')}"
+            )
+            continue
+
+        valid_cut_results.append((data_cut, detail, cohort_info, actual_cut_by_h))
         all_detail.append(detail)
+
+        cut_i = len(valid_cut_results)
 
         print("\n" + "#" * 110)
         target_map = (
@@ -777,6 +796,18 @@ def run_analysis():
                     field,
                     n=TOP_ASINS_TO_PRINT,
                 )
+
+    if not all_detail:
+        raise RuntimeError(
+            "No valid origin cut contains a complete current week plus H1/H2/H3 "
+            "future order_week plan sequence."
+        )
+
+    if len(all_detail) < MAX_CUTS:
+        print(
+            f"\n[WARNING] Only {len(all_detail)} valid cuts were found; "
+            f"requested {MAX_CUTS}."
+        )
 
     combined = pd.concat(all_detail, ignore_index=True)
 
