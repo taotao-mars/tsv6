@@ -2575,8 +2575,8 @@ class _GraphContextMixin:
                     fc[step_h, idx[col]] = float(base_vec[k]) * h_decay
         return fc
 
-    def _dynamic_topk_peers(self, asin, top_k):
-        """Return a stable Top-K candidate set; dynamic signs are learned by the model."""
+    def _dynamic_topk_peers(self, asin, top_k, min_similarity=0.55):
+        """Return at most Top-K candidates that pass a static similarity floor."""
         mi = self.data[asin].get("graph_meta", {})
         candidates = self.graph_neighbor_map.get(asin, [])
         scored = [
@@ -2584,7 +2584,10 @@ class _GraphContextMixin:
             for b in candidates if b in self.data and b != asin
         ]
         scored.sort(key=lambda x: (-x[0], x[1]))
-        return [(b, score) for score, _, b in scored[:int(top_k)]]
+        return [
+            (b, score) for score, _, b in scored
+            if score >= float(min_similarity)
+        ][:int(top_k)]
 
 
 # Demand dataset integration
@@ -2678,7 +2681,8 @@ class DemandDataset(_GraphContextMixin, _ORIGINAL_DEMAND_DATASET_BEFORE_GRAPH_CO
 
     def __init__(self, data, history=52, horizon=3, mode="train", val_weeks=20,
                  min_graph_neighbors=3, num_build_workers=None,
-                 graph_variant="legacy", dynamic_graph_top_k=10):
+                 graph_variant="legacy", dynamic_graph_top_k=10,
+                 dynamic_graph_min_similarity=0.55):
         _ds_t0 = time.perf_counter()
         self.data = data
         self.history = int(history)
@@ -2689,6 +2693,7 @@ class DemandDataset(_GraphContextMixin, _ORIGINAL_DEMAND_DATASET_BEFORE_GRAPH_CO
         if self.graph_variant not in {"legacy", "dynamic_signed"}:
             raise ValueError("graph_variant must be 'legacy' or 'dynamic_signed'.")
         self.dynamic_graph_top_k = int(dynamic_graph_top_k)
+        self.dynamic_graph_min_similarity = float(dynamic_graph_min_similarity)
         self.samples = []
 
         print(
@@ -2701,7 +2706,12 @@ class DemandDataset(_GraphContextMixin, _ORIGINAL_DEMAND_DATASET_BEFORE_GRAPH_CO
         print(f"[DATASET-EAGER] graph neighbor initialization START | mode={self.mode}", flush=True)
         self._init_graph_context(min_graph_neighbors=min_graph_neighbors)
         self.dynamic_peer_map = (
-            {a: self._dynamic_topk_peers(a, self.dynamic_graph_top_k) for a in self.data}
+            {
+                a: self._dynamic_topk_peers(
+                    a, self.dynamic_graph_top_k, self.dynamic_graph_min_similarity
+                )
+                for a in self.data
+            }
             if self.graph_variant == "dynamic_signed" else {}
         )
         print(
@@ -2908,9 +2918,12 @@ class DynamicSignedGraphMessage(nn.Module):
     dynamically assign neutral/positive/competitive probabilities at each FCD.
     The sampled shared z enters message values, not candidate selection.
     """
-    def __init__(self, d_model=32, d_z=16, horizon=3, hidden=64):
+    def __init__(self, d_model=32, d_z=16, horizon=3, hidden=64,
+                 neutral_threshold=0.50, gate_temperature=0.10):
         super().__init__()
         self.horizon = horizon
+        self.neutral_threshold = float(neutral_threshold)
+        self.gate_temperature = float(gate_temperature)
         self.activity_head = nn.Linear(d_model, 1)
         edge_dim = 4 * d_model + 1
         self.edge_net = nn.Sequential(
@@ -2947,16 +2960,34 @@ class DynamicSignedGraphMessage(nn.Module):
         pair_gate = 1.0 - (1.0 - target_active[:, None]) * (1.0 - peer_active)
         valid = peer_mask.float()
 
-        pos_w = relation_prob[..., 1] * pair_gate * valid
-        neg_w = relation_prob[..., 2] * pair_gate * valid
-        pos_w = pos_w / pos_w.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        neg_w = neg_w / neg_w.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        # Neutral is an edge-rejection class, never a message channel. During
+        # training use a differentiable gate; at inference use the exact hard
+        # threshold used by effective-neighbor diagnostics.
+        relation_confidence = 1.0 - relation_prob[..., 0]
+        if self.training:
+            edge_gate = torch.sigmoid(
+                (relation_confidence - self.neutral_threshold)
+                / max(self.gate_temperature, 1e-4)
+            )
+        else:
+            edge_gate = (relation_confidence >= self.neutral_threshold).float()
+        edge_gate = edge_gate * valid
+
+        pos_raw = relation_prob[..., 1] * pair_gate * edge_gate
+        neg_raw = relation_prob[..., 2] * pair_gate * edge_gate
+        pos_w = pos_raw / pos_raw.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        neg_w = neg_raw / neg_raw.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+        # Preserve total evidence. Without this strength term, normalization
+        # would amplify several 0.01-probability edges into a full message.
+        pos_strength = 1.0 - torch.prod(1.0 - pos_raw.clamp(0.0, 1.0), dim=1)
+        neg_strength = 1.0 - torch.prod(1.0 - neg_raw.clamp(0.0, 1.0), dim=1)
 
         z_peer = self.z_proj(z)[:, None, :].expand_as(peer_phi)
         pos_value = self.pos_value(torch.cat([peer_phi, z_peer], dim=-1))
         neg_value = self.neg_value(torch.cat([peer_phi, z_peer], dim=-1))
-        pos_msg = torch.sum(pos_w.unsqueeze(-1) * pos_value, dim=1)
-        neg_msg = torch.sum(neg_w.unsqueeze(-1) * neg_value, dim=1)
+        pos_msg = torch.sum(pos_w.unsqueeze(-1) * pos_value, dim=1) * pos_strength[:, None]
+        neg_msg = torch.sum(neg_w.unsqueeze(-1) * neg_value, dim=1) * neg_strength[:, None]
         message = self.message_out(torch.cat([target_phi, pos_msg, neg_msg], dim=-1))
         return {
             "mu_residual": self.mu_head(message),
@@ -2966,6 +2997,12 @@ class DynamicSignedGraphMessage(nn.Module):
             "relation_logits": relation_logits,
             "positive_weight": pos_w,
             "competitive_weight": neg_w,
+            "edge_gate": edge_gate,
+            "relation_confidence": relation_confidence,
+            "positive_strength": pos_strength,
+            "competitive_strength": neg_strength,
+            "positive_message_norm": torch.linalg.vector_norm(pos_msg, dim=-1),
+            "competitive_message_norm": torch.linalg.vector_norm(neg_msg, dim=-1),
         }
 
 
@@ -2985,7 +3022,9 @@ class JointExposureDemandH3(nn.Module):
     def __init__(self, input_dim, context_dim, d_model=32, d_z=16,
                  horizon=3, prior_scale=0.3,
                  detach_exposure_for_demand=False,
-                 graph_variant="legacy"):
+                 graph_variant="legacy",
+                 graph_neutral_threshold=0.50,
+                 graph_gate_temperature=0.10):
         super().__init__()
         if horizon != 3:
             raise ValueError("This experimental file is intentionally H3 only.")
@@ -3053,7 +3092,11 @@ class JointExposureDemandH3(nn.Module):
         )
         self.decoder_epinet_scale = 0.35
         self.dynamic_graph = (
-            DynamicSignedGraphMessage(d_model=d_model, d_z=d_z, horizon=horizon)
+            DynamicSignedGraphMessage(
+                d_model=d_model, d_z=d_z, horizon=horizon,
+                neutral_threshold=graph_neutral_threshold,
+                gate_temperature=graph_gate_temperature,
+            )
             if self.graph_variant == "dynamic_signed" else None
         )
 
@@ -3429,8 +3472,12 @@ def compute_dynamic_graph_diagnostics(model, va_ld):
         return {}
     totals = {
         "graph_candidate_edges": 0.0, "graph_rank_eligible_edges": 0.0,
+        "graph_effective_edges": 0.0, "graph_positive_edges": 0.0,
+        "graph_competitive_edges": 0.0, "graph_target_asins": 0.0,
         "graph_positive_prob": 0.0, "graph_competitive_prob": 0.0,
         "graph_neutral_prob": 0.0, "graph_edge_entropy": 0.0,
+        "graph_positive_message_norm": 0.0,
+        "graph_competitive_message_norm": 0.0,
     }
     model.eval()
     with torch.no_grad():
@@ -3442,13 +3489,22 @@ def compute_dynamic_graph_diagnostics(model, va_ld):
                 peer_static=b["peer_static"],
             )
             prob = torch.softmax(out["relation_logits"], dim=-1)
+            graph0 = out["graph_outputs"][0]
             mask = b["peer_mask"] > 0
+            effective = graph0["edge_gate"] > 0
+            relation_class = prob.argmax(dim=-1)
             target_active = b["y"].sum(dim=-1) > 0
             peer_active = b["peer_y"].sum(dim=-1) > 0
             rank_mask = mask & (target_active[:, None] | peer_active)
             n = mask.float().sum()
             totals["graph_candidate_edges"] += float(n.item())
             totals["graph_rank_eligible_edges"] += float(rank_mask.float().sum().item())
+            totals["graph_effective_edges"] += float(effective.float().sum().item())
+            totals["graph_positive_edges"] += float((effective & (relation_class == 1)).float().sum().item())
+            totals["graph_competitive_edges"] += float((effective & (relation_class == 2)).float().sum().item())
+            totals["graph_target_asins"] += float(b["y"].shape[0])
+            totals["graph_positive_message_norm"] += float(graph0["positive_message_norm"].sum().item())
+            totals["graph_competitive_message_norm"] += float(graph0["competitive_message_norm"].sum().item())
             if n.item() > 0:
                 totals["graph_neutral_prob"] += float((prob[..., 0] * mask).sum().item())
                 totals["graph_positive_prob"] += float((prob[..., 1] * mask).sum().item())
@@ -3459,6 +3515,13 @@ def compute_dynamic_graph_diagnostics(model, va_ld):
     for key in ["graph_neutral_prob", "graph_positive_prob", "graph_competitive_prob", "graph_edge_entropy"]:
         totals[key] /= denom
     totals["graph_rank_eligible_rate"] = totals["graph_rank_eligible_edges"] / denom
+    target_denom = max(totals["graph_target_asins"], 1.0)
+    totals["graph_mean_candidate_neighbors"] = totals["graph_candidate_edges"] / target_denom
+    totals["graph_mean_effective_neighbors"] = totals["graph_effective_edges"] / target_denom
+    totals["graph_mean_positive_neighbors"] = totals["graph_positive_edges"] / target_denom
+    totals["graph_mean_competitive_neighbors"] = totals["graph_competitive_edges"] / target_denom
+    totals["graph_positive_message_norm"] /= target_denom
+    totals["graph_competitive_message_norm"] /= target_denom
     return totals
 
 
@@ -3593,6 +3656,9 @@ def run_joint_exposure_demand_h3_end2end(
     dph_cap_end_week=None,
     graph_variant="legacy",
     dynamic_graph_top_k=10,
+    dynamic_graph_min_similarity=0.55,
+    graph_neutral_threshold=0.50,
+    graph_gate_temperature=0.10,
     lambda_graph_aux=0.10,
 ):
     """Run non-rolling H3 joint model on one snapshot.
@@ -3614,7 +3680,11 @@ def run_joint_exposure_demand_h3_end2end(
     print("JOINT EXPOSURE + DEMAND H3 END-TO-END V1.2 | TWO-STEP WAPE-ALIGNED")
     print("Shared encoder: YES | Separate decoders: YES")
     print(f"Demand gradient through exposure_hat: {not detach_exposure_for_demand}")
-    print(f"Graph variant: {graph_variant} | dynamic Top-K: {dynamic_graph_top_k}")
+    print(
+        f"Graph variant: {graph_variant} | dynamic max-K: {dynamic_graph_top_k} | "
+        f"minimum static similarity: {dynamic_graph_min_similarity} | "
+        f"neutral threshold: {graph_neutral_threshold} | DEVICE: {DEVICE}"
+    )
     print("=" * 88)
 
     if scot_df is None:
@@ -3699,6 +3769,7 @@ def run_joint_exposure_demand_h3_end2end(
     tr_ds = DemandDataset(
         data, history, horizon, "train", horizon, num_build_workers=4,
         graph_variant=graph_variant, dynamic_graph_top_k=dynamic_graph_top_k,
+        dynamic_graph_min_similarity=dynamic_graph_min_similarity,
     )
     print(
         f"[PROFILE-DATASET] train lazy dataset DONE | samples={len(tr_ds):,} | elapsed={time.perf_counter()-_ds_t0:.2f}s",
@@ -3710,6 +3781,7 @@ def run_joint_exposure_demand_h3_end2end(
     va_ds = DemandDataset(
         data, history, horizon, "val", horizon, num_build_workers=4,
         graph_variant=graph_variant, dynamic_graph_top_k=dynamic_graph_top_k,
+        dynamic_graph_min_similarity=dynamic_graph_min_similarity,
     )
     print(
         f"[PROFILE-DATASET] validation lazy dataset DONE | samples={len(va_ds):,} | elapsed={time.perf_counter()-_ds_t0:.2f}s",
@@ -3740,6 +3812,8 @@ def run_joint_exposure_demand_h3_end2end(
         prior_scale=0.3,
         detach_exposure_for_demand=detach_exposure_for_demand,
         graph_variant=graph_variant,
+        graph_neutral_threshold=graph_neutral_threshold,
+        graph_gate_temperature=graph_gate_temperature,
     ).to(DEVICE)
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     print(f"Training on: {DEVICE}")
@@ -4335,6 +4409,9 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     scot_prefix=ROLLING_SCOT_PREFIX,
     graph_variant="legacy",
     dynamic_graph_top_k=10,
+    dynamic_graph_min_similarity=0.55,
+    graph_neutral_threshold=0.50,
+    graph_gate_temperature=0.10,
     lambda_graph_aux=0.10,
 ):
     """
@@ -4416,7 +4493,11 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     print("Output root:", output_root.resolve())
     print("Model unchanged from non-rolling V1.2: YES")
     print("Metrics retained: P50, P70, and P90")
-    print(f"Graph variant: {graph_variant} | dynamic Top-K: {dynamic_graph_top_k}")
+    print(
+        f"Graph variant: {graph_variant} | dynamic max-K: {dynamic_graph_top_k} | "
+        f"minimum static similarity: {dynamic_graph_min_similarity} | "
+        f"neutral threshold: {graph_neutral_threshold} | DEVICE: {DEVICE}"
+    )
     print(
         "WAPE: calls original calculate_wape_using_lp_oos2 "
         "+ quick_error_check; no local WAPE formula"
@@ -4732,6 +4813,9 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                     dph_cap_end_week=dph_cap_end_week,
                     graph_variant=graph_variant,
                     dynamic_graph_top_k=dynamic_graph_top_k,
+                    dynamic_graph_min_similarity=dynamic_graph_min_similarity,
+                    graph_neutral_threshold=graph_neutral_threshold,
+                    graph_gate_temperature=graph_gate_temperature,
                     lambda_graph_aux=lambda_graph_aux,
                 )
 
@@ -5011,26 +5095,17 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 # ============================================================================
 # GRAPH COMPARISON RUNNER
 # ============================================================================
-def run_legacy_vs_dynamic_graph_comparison(
+def run_dynamic_vs_legacy_graph_comparison(
     output_root="joint_h3_usage_graph_comparison",
     **rolling_kwargs,
 ):
-    """Matched ablation: current peer-mean Graph vs dynamic signed Graph."""
+    """Matched ablation: run the new dynamic Graph first, then legacy Graph."""
     root = Path(output_root)
     common = dict(rolling_kwargs)
     common["resume_existing"] = common.get("resume_existing", True)
 
     print("\n" + "=" * 100)
-    print("GRAPH ABLATION A/2 | LEGACY PEER-MEAN GRAPH")
-    print("=" * 100)
-    legacy = run_joint_h3_s3_rolling_scot_p50_p70(
-        **common,
-        graph_variant="legacy",
-        output_root=str(root / "legacy_graph"),
-    )
-
-    print("\n" + "=" * 100)
-    print("GRAPH ABLATION B/2 | ACTIVITY-GATED DYNAMIC SIGNED GRAPH")
+    print("GRAPH ABLATION A/2 | NEW ACTIVITY-GATED DYNAMIC SIGNED GRAPH")
     print("=" * 100)
     dynamic = run_joint_h3_s3_rolling_scot_p50_p70(
         **common,
@@ -5038,14 +5113,35 @@ def run_legacy_vs_dynamic_graph_comparison(
         output_root=str(root / "dynamic_signed_graph"),
     )
 
+    print("\n" + "=" * 100)
+    print("GRAPH ABLATION B/2 | OLD LEGACY PEER-MEAN GRAPH")
+    print("=" * 100)
+    legacy = run_joint_h3_s3_rolling_scot_p50_p70(
+        **common,
+        graph_variant="legacy",
+        output_root=str(root / "legacy_graph"),
+    )
+
     legacy_summary = legacy["summary"].copy()
     dynamic_summary = dynamic["summary"].copy()
     legacy_summary["graph_variant"] = "legacy"
     dynamic_summary["graph_variant"] = "dynamic_signed"
-    comparison = pd.concat([legacy_summary, dynamic_summary], ignore_index=True)
+    comparison = pd.concat([dynamic_summary, legacy_summary], ignore_index=True)
     comparison_path = root / "graph_comparison_summary.csv"
     root.mkdir(parents=True, exist_ok=True)
     comparison.to_csv(comparison_path, index=False)
+
+    print("\n" + "=" * 120)
+    print("FINAL GRAPH COMPARISON SUMMARY | DYNAMIC SIGNED FIRST, LEGACY SECOND")
+    print("=" * 120)
+    with pd.option_context(
+        "display.max_columns", None,
+        "display.max_rows", None,
+        "display.width", 240,
+        "display.max_colwidth", 40,
+    ):
+        print(comparison.to_string(index=False))
+    print("=" * 120)
     print(f"Graph comparison summary saved: {comparison_path}")
     return {
         "comparison": comparison,
@@ -5055,6 +5151,10 @@ def run_legacy_vs_dynamic_graph_comparison(
     }
 
 
+# Backward-compatible alias for notebooks that already referenced the old name.
+run_legacy_vs_dynamic_graph_comparison = run_dynamic_vs_legacy_graph_comparison
+
+
 # ============================================================================
 # USAGE GRAPH COMPARISON: SAME SETTING AS QUICK VALIDATION
 # ============================================================================
@@ -5062,7 +5162,7 @@ def run_legacy_vs_dynamic_graph_comparison(
 # rolling cuts, seed, sampled cohort logic, model dimensions, training epochs,
 # WAPE evaluator, and exposure loss. Only graph_variant changes.
 #
-# graph_comparison = run_legacy_vs_dynamic_graph_comparison(
+# graph_comparison = run_dynamic_vs_legacy_graph_comparison(
 #     n_asins=5000,
 #     seed=42,
 #     max_snapshots=2,
@@ -5077,10 +5177,13 @@ def run_legacy_vs_dynamic_graph_comparison(
 #     M_eval=100,
 #     lambda_exposure=0.50,
 #     dynamic_graph_top_k=10,
+#     dynamic_graph_min_similarity=0.55,
+#     graph_neutral_threshold=0.50,
+#     graph_gate_temperature=0.10,
 #     lambda_graph_aux=0.10,
 #     detach_exposure_for_demand=False,
 #     remove_oos_dp=True,
-#     resume_existing=True,
+#     resume_existing=False,  # force all four matched trainings for a clean ablation
 #     continue_on_error=False,
 #     output_root="joint_h3_usage_graph_comparison_5000",
 # )
