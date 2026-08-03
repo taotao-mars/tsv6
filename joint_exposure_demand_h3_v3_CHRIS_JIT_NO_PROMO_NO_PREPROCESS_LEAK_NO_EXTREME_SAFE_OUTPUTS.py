@@ -33,29 +33,8 @@ from sklearn.metrics import roc_auc_score
 torch.manual_seed(42)
 np.random.seed(42)
 
-# =============================================================================
-# CHRIS-JIT PATCH SWITCH
-#
-# Controls the fallback used for ind_promotion / promotion_pricing_amount /
-# pricing_type on H1/H2/H3 rows when origin_raw has no value for that
-# (asin, order_week).
-#
-#   False (default) -> leave as NaN. Downstream _safe_numeric() then fills
-#                       these with 0.0, i.e. "no promo/pricing signal known
-#                       at the origin cut."
-#   True             -> fill with the origin cut's own last known value per
-#                        ASIN (a real lag1, computed inside the rolling loop
-#                        itself, since DemandDataset's built-in lag1 logic
-#                        never actually fires here -- see the rolling loop
-#                        comment near the ORIGIN-PLAN-PATCH block for why).
-#
-# Flip to True only after you've decided lag1 is the right call for these
-# three fields.
-# =============================================================================
-ORIGIN_PLAN_LAG1_FALLBACK_ENABLED = False
-
 print(
-    "[VERSION] v3 CHRIS-JIT | promotion future features removed | "
+    "[VERSION] v3 CHRIS-JIT | H1-H3 plan features from current origin cut | "
     "history-only preprocessing | no extreme-ASIN filter | isolated outputs",
     flush=True,
 )
@@ -675,6 +654,123 @@ def _apply_dph_cap(df, cap):
             if np.isfinite(cap):
                 df[c] = df[c].clip(upper=cap)
     return df
+
+
+
+PLAN_FEATURE_COLS = [
+    "ind_promotion",
+    "promotion_pricing_amount",
+    "pricing_type",
+]
+
+
+def _overwrite_h1_h3_plan_from_current_cut(
+    data_raw1,
+    origin_raw,
+    selected_asins,
+    expected_h1,
+    expected_h2,
+    expected_h3,
+):
+    """
+    Change ONLY the three promotion/pricing H1-H3 feature columns.
+
+    The modeling dataframe remains based on eval_raw so all existing target,
+    history, graph, split, loss, and evaluation logic is unchanged. For exact
+    H1/H2/H3 rows, however, the three plan fields are cleared and replaced by
+    values from the CURRENT origin cut using (asin, order_week).
+
+    If an origin-cut H1/H2/H3 plan cell is missing, use the latest non-null
+    value for that ASIN at or before the forecast origin, also from origin_raw.
+    No value from a later evaluation cut is retained for these three fields.
+    """
+    out = data_raw1.copy()
+    origin = origin_raw.copy()
+
+    target_weeks = pd.DatetimeIndex(
+        [pd.Timestamp(expected_h1), pd.Timestamp(expected_h2), pd.Timestamp(expected_h3)]
+    )
+    selected_asins = set(str(x).strip() for x in selected_asins)
+
+    for frame in (out, origin):
+        frame["asin"] = frame["asin"].astype(str).str.strip()
+        frame["order_week"] = pd.to_datetime(frame["order_week"], errors="coerce")
+
+    out_target_mask = (
+        out["asin"].isin(selected_asins)
+        & out["order_week"].isin(target_weeks)
+    )
+
+    # Always clear evaluation-cut values first, including columns absent from
+    # origin_raw, so no realized evaluation value can leak into H1/H2/H3.
+    for col in PLAN_FEATURE_COLS:
+        if col not in out.columns:
+            out[col] = np.nan
+        out.loc[out_target_mask, col] = np.nan
+
+    origin_target = origin[
+        origin["asin"].isin(selected_asins)
+        & origin["order_week"].isin(target_weeks)
+    ].copy()
+
+    # One row per ASIN-week. Keep the last occurrence if the source contains
+    # duplicates, matching the current snapshot's final stored record.
+    available_plan_cols = [c for c in PLAN_FEATURE_COLS if c in origin_target.columns]
+    origin_plan = (
+        origin_target[["asin", "order_week"] + available_plan_cols]
+        .drop_duplicates(["asin", "order_week"], keep="last")
+    )
+
+    if not origin_plan.empty:
+        origin_plan = origin_plan.rename(
+            columns={c: f"__origin_plan__{c}" for c in available_plan_cols}
+        )
+        out = out.merge(
+            origin_plan,
+            on=["asin", "order_week"],
+            how="left",
+            validate="many_to_one",
+        )
+        for col in available_plan_cols:
+            patch_col = f"__origin_plan__{col}"
+            mask = out["order_week"].isin(target_weeks)
+            out.loc[mask, col] = out.loc[mask, patch_col]
+            out = out.drop(columns=[patch_col])
+
+    # Missing-only lag1 fallback, computed exclusively from the same origin cut.
+    origin_week = origin.loc[
+        origin["asin"].isin(selected_asins)
+        & ~origin["order_week"].isin(target_weeks),
+        "order_week",
+    ].max()
+
+    if pd.notna(origin_week):
+        hist = origin[
+            origin["asin"].isin(selected_asins)
+            & (origin["order_week"] <= origin_week)
+        ].sort_values(["asin", "order_week"])
+
+        for col in PLAN_FEATURE_COLS:
+            if col not in hist.columns:
+                continue
+            latest = (
+                hist.dropna(subset=[col])
+                .drop_duplicates("asin", keep="last")[["asin", col]]
+                .rename(columns={col: f"__origin_lag1__{col}"})
+            )
+            out = out.merge(latest, on="asin", how="left", validate="many_to_one")
+            lag_col = f"__origin_lag1__{col}"
+            fill_mask = out["order_week"].isin(target_weeks) & out[col].isna()
+            out.loc[fill_mask, col] = out.loc[fill_mask, lag_col]
+            out = out.drop(columns=[lag_col])
+
+    print(
+        "[CURRENT-CUT-PLAN] H1/H2/H3 plan features overwritten from origin_raw | "
+        f"weeks={[d.date() for d in target_weeks]} | "
+        f"columns={PLAN_FEATURE_COLS}",
+        flush=True,
+    )
+    return out
 
 
 
@@ -4384,6 +4480,18 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             expected_h2 = expected_h1 + pd.Timedelta(days=7)
             expected_h3 = expected_h1 + pd.Timedelta(days=14)
 
+            # Minimal patch: keep every other field and all existing model logic
+            # unchanged; overwrite only the three H1/H2/H3 plan features using
+            # the current origin cut.
+            data_raw1 = _overwrite_h1_h3_plan_from_current_cut(
+                data_raw1=data_raw1,
+                origin_raw=origin_raw,
+                selected_asins=rolling_asins,
+                expected_h1=expected_h1,
+                expected_h2=expected_h2,
+                expected_h3=expected_h3,
+            )
+
             # Last actually observable week at this rolling forecast origin.
             # Estimate the global DPH cap only from these origin-snapshot rows;
             # the later evaluation snapshot is still used to supply H1-H3 targets.
@@ -4419,147 +4527,6 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 "Expected H1/H2/H3:",
                 [expected_h1, expected_h2, expected_h3],
             )
-
-            # ------------------------------------------------------------
-            # CHRIS-JIT PATCH: origin-known plan values for H1/H2/H3.
-            #
-            # By default data_raw1 (built above from eval_raw) carries the
-            # LATER evaluation snapshot's realized values for every column,
-            # including ind_promotion / promotion_pricing_amount /
-            # pricing_type. For H1/H2/H3 rows specifically, that means the
-            # model would see the post-hoc actual promo/pricing outcome
-            # instead of what was actually knowable at the origin cut.
-            #
-            # This block overwrites ONLY those three columns, and ONLY for
-            # rows whose order_week is exactly H1/H2/H3, with the value
-            # already present in origin_raw (the current cut) for that same
-            # (asin, order_week).
-            #
-            # NOTE on fallback: DemandDataset._make_future_context_with_dph_proxies
-            # has its own lag1 logic (checks np.isfinite on plan_values), but
-            # load_real_data's _safe_numeric step already fills every NaN in
-            # context_cols with 0.0 BEFORE DemandDataset ever sees the data,
-            # so that built-in lag1 branch never actually fires for these
-            # columns. To make ORIGIN_PLAN_LAG1_FALLBACK_ENABLED do anything
-            # real, the lag1 fill (when enabled) happens right here, before
-            # data_raw1 reaches load_real_data.
-            #
-            # Nothing else about data_raw1, context_cols, load_real_data,
-            # or DemandDataset is changed.
-            # ------------------------------------------------------------
-            _ORIGIN_PLAN_COLS = [
-                "ind_promotion",
-                "promotion_pricing_amount",
-                "pricing_type",
-            ]
-            _origin_plan_cols_present = [
-                c for c in _ORIGIN_PLAN_COLS if c in origin_raw.columns
-            ]
-
-            if _origin_plan_cols_present:
-                _target_weeks = {expected_h1, expected_h2, expected_h3}
-
-                origin_plan_lookup = (
-                    origin_raw[origin_raw["asin"].isin(rolling_asins)]
-                    [["asin", "order_week"] + _origin_plan_cols_present]
-                    .dropna(subset=["asin", "order_week"])
-                    .drop_duplicates(subset=["asin", "order_week"], keep="last")
-                    .rename(
-                        columns={
-                            c: f"__origin_plan__{c}"
-                            for c in _origin_plan_cols_present
-                        }
-                    )
-                )
-
-                data_raw1 = data_raw1.merge(
-                    origin_plan_lookup,
-                    on=["asin", "order_week"],
-                    how="left",
-                )
-
-                if ORIGIN_PLAN_LAG1_FALLBACK_ENABLED:
-                    # Real lag1: the origin cut's own last known value per
-                    # ASIN, i.e. the most recent origin_raw row at or before
-                    # the origin cut date itself.
-                    origin_lag1_lookup = (
-                        origin_raw[
-                            origin_raw["asin"].isin(rolling_asins)
-                            & (origin_raw["order_week"] <= data_cut)
-                        ]
-                        .sort_values(["asin", "order_week"])
-                        .groupby("asin", as_index=False)
-                        .last()
-                        [["asin"] + _origin_plan_cols_present]
-                        .rename(
-                            columns={
-                                c: f"__origin_lag1__{c}"
-                                for c in _origin_plan_cols_present
-                            }
-                        )
-                    )
-                    data_raw1 = data_raw1.merge(
-                        origin_lag1_lookup,
-                        on="asin",
-                        how="left",
-                    )
-
-                _is_target_week = data_raw1["order_week"].isin(_target_weeks)
-                _overwritten_rows = 0
-                _lag1_filled_rows = 0
-
-                for c in _origin_plan_cols_present:
-                    origin_col = f"__origin_plan__{c}"
-                    has_origin_value = data_raw1[origin_col].notna()
-
-                    if c not in data_raw1.columns:
-                        data_raw1[c] = np.nan
-
-                    # H1-H3 rows: drop whatever eval_raw supplied first, so a
-                    # miss never silently keeps the post-hoc realized value.
-                    data_raw1.loc[_is_target_week, c] = np.nan
-
-                    overwrite_mask = _is_target_week & has_origin_value
-                    _overwritten_rows += int(overwrite_mask.sum())
-                    data_raw1.loc[overwrite_mask, c] = data_raw1.loc[
-                        overwrite_mask, origin_col
-                    ]
-                    data_raw1 = data_raw1.drop(columns=[origin_col])
-
-                    if ORIGIN_PLAN_LAG1_FALLBACK_ENABLED:
-                        lag1_col = f"__origin_lag1__{c}"
-                        still_missing = _is_target_week & data_raw1[c].isna()
-                        has_lag1_value = data_raw1[lag1_col].notna()
-                        fill_mask = still_missing & has_lag1_value
-                        _lag1_filled_rows += int(fill_mask.sum())
-                        data_raw1.loc[fill_mask, c] = data_raw1.loc[
-                            fill_mask, lag1_col
-                        ]
-                        data_raw1 = data_raw1.drop(columns=[lag1_col])
-
-                _rows_per_col = int(_is_target_week.sum())
-                _still_zero_filled = (
-                    (_rows_per_col * len(_origin_plan_cols_present))
-                    - _overwritten_rows
-                    - _lag1_filled_rows
-                )
-                print(
-                    f"[ORIGIN-PLAN-PATCH] cols={_origin_plan_cols_present} | "
-                    f"lag1_fallback={'ON' if ORIGIN_PLAN_LAG1_FALLBACK_ENABLED else 'OFF'} | "
-                    f"H1-H3 rows filled from origin cut={_overwritten_rows:,} | "
-                    f"H1-H3 rows filled via lag1={_lag1_filled_rows:,} | "
-                    f"H1-H3 rows left for _safe_numeric->0.0={_still_zero_filled:,}",
-                    flush=True,
-                )
-            else:
-                print(
-                    "[ORIGIN-PLAN-PATCH] none of ind_promotion / "
-                    "promotion_pricing_amount / pricing_type found in "
-                    "origin_raw; H1-H3 values remain sourced from eval_raw "
-                    "for these columns.",
-                    flush=True,
-                )
-
             print("Joint cohort sampled ASINs:", len(rolling_asins))
             print("SCOT ASINs:", len(scot_set))
             print("Evaluation ASINs:", len(eval_set))
@@ -4597,6 +4564,14 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 data_raw1 = eval_raw[
                     eval_raw["asin"].astype(str).str.strip().isin(loaded_asins)
                 ].copy()
+                data_raw1 = _overwrite_h1_h3_plan_from_current_cut(
+                    data_raw1=data_raw1,
+                    origin_raw=origin_raw,
+                    selected_asins=loaded_asins,
+                    expected_h1=expected_h1,
+                    expected_h2=expected_h2,
+                    expected_h3=expected_h3,
+                )
                 scot_df = scot_df[
                     scot_df["asin"].astype(str).str.strip().isin(loaded_asins)
                 ].copy()
