@@ -14,7 +14,7 @@
 #     - H3 actual comes from cut i+3, matched by ASIN + original H3 order_week
 #
 # Cohort:
-#   Chris ∩ JIT ∩ current-cut scot_oos=0
+#   current origin snapshot ASINs ∩ Chris ∩ JIT
 #
 # Output:
 #   Prints metrics and examples only. No files are saved.
@@ -41,8 +41,8 @@ DATA_PREFIX = (
 CHRIS_CSV = "asin_list_from_amxl_fcst_scot_to_chris_20260723.csv"
 JIT_CSV = "jit_asin_list_from_Hrishi_20270727.csv"
 
-# Latest N valid origin cuts to analyze.
-MAX_VALID_ORIGIN_CUTS = 3
+# Analyze only the first N eligible origin cuts returned by the cut list.
+MAX_ORIGIN_CUTS = 3
 
 # Number of largest-gap ASIN examples printed for each field/horizon.
 TOP_ASINS_TO_PRINT = 10
@@ -190,7 +190,7 @@ def build_origin_candidates(cuts):
         )
 
     return pd.DataFrame(rows).sort_values(
-        "origin_cut", ascending=False
+        "origin_cut", ascending=True
     ).reset_index(drop=True)
 
 
@@ -273,40 +273,18 @@ def determine_selected_asins(
     jit_set,
 ):
     """
-    Chris ∩ JIT ∩ current-cut scot_oos=0.
+    Use the joint ASIN cohort only:
+      current origin snapshot ASINs ∩ Chris ∩ JIT
 
-    scot_oos is taken from the latest origin-snapshot row at or before
-    current_order_week for each ASIN.
+    No additional scot_oos filtering is applied.
     """
-    scot_col = find_scot_oos_col(origin)
-
     origin_asins = set(origin["asin"].dropna().astype(str))
-    joint = origin_asins & chris_set & jit_set
-
-    scot_hist = origin[
-        origin["asin"].isin(joint)
-        & (origin["order_week"] <= current_order_week)
-    ][["asin", "order_week", scot_col]].copy()
-
-    scot_hist[scot_col] = pd.to_numeric(
-        scot_hist[scot_col], errors="coerce"
-    )
-
-    latest_scot = (
-        scot_hist.sort_values(["asin", "order_week"])
-        .groupby("asin", as_index=False)
-        .tail(1)
-    )
-
-    selected = sorted(
-        set(latest_scot.loc[latest_scot[scot_col].eq(0), "asin"])
-    )
+    selected = sorted(origin_asins & chris_set & jit_set)
 
     return selected, {
         "origin_asins": len(origin_asins),
-        "chris_jit_joint": len(joint),
-        "scot_oos0_selected": len(selected),
-        "scot_oos_col": scot_col,
+        "chris_jit_joint": len(selected),
+        "selected_asins": len(selected),
     }
 
 
@@ -353,7 +331,7 @@ def build_detail_for_origin(
     if not selected:
         return None, {
             **cohort_info,
-            "skip_reason": "Chris ∩ JIT ∩ scot_oos=0 cohort is empty",
+            "skip_reason": "current-cut ASINs ∩ Chris ∩ JIT cohort is empty",
         }
 
     # Current-cut PLAN values.
@@ -726,8 +704,7 @@ def print_cut_report(detail, info):
     )
     print(
         f"Cohort: origin ASINs={info['origin_asins']:,} | "
-        f"Chris∩JIT={info['chris_jit_joint']:,} | "
-        f"scot_oos=0 selected={info['scot_oos0_selected']:,}"
+        f"joint selected={info['selected_asins']:,}"
     )
     print(
         "Matched actual source rows: "
@@ -795,7 +772,7 @@ def print_combined_report(combined):
 # ----------------------------------------------------------------
 def main():
     print("=" * 118)
-    print("CURRENT-CUT H1/H2/H3 PLAN VS FUTURE REALIZED VALUE CHECK")
+    print("FIRST 3 CUTS — JOINT ASINS — PLAN VS FUTURE REALIZED VALUE CHECK")
     print("=" * 118)
     print("Nothing will be written to disk.")
 
@@ -819,15 +796,12 @@ def main():
         "asin",
         "order_week",
         *PLAN_FIELDS,
-        *SCOT_OOS_CANDIDATES,
     ]
 
     valid_details = []
 
-    # Scan newest to oldest and retain the latest N valid origin cuts.
-    for _, row in candidates.iterrows():
-        if len(valid_details) >= MAX_VALID_ORIGIN_CUTS:
-            break
+    # Run only the first three eligible origin cuts.
+    for _, row in candidates.head(MAX_ORIGIN_CUTS).iterrows():
 
         origin_cut = pd.Timestamp(row["origin_cut"])
 
@@ -882,10 +856,10 @@ def main():
             "No valid origin cuts were found. Check snapshot schema and cohort files."
         )
 
-    if len(valid_details) < MAX_VALID_ORIGIN_CUTS:
+    if len(valid_details) < MAX_ORIGIN_CUTS:
         print(
-            f"\n[WARNING] Requested {MAX_VALID_ORIGIN_CUTS} valid cuts, "
-            f"but found only {len(valid_details)}."
+            f"\n[WARNING] Requested the first {MAX_ORIGIN_CUTS} cuts, "
+            f"but only {len(valid_details)} produced valid comparisons."
         )
 
     combined = pd.concat(valid_details, ignore_index=True)
