@@ -1,6 +1,6 @@
 # ================================================================
 # JOINT Chris ∩ JIT ∩ scot_oos=0
-# Latest 3 origin cuts: PLAN vs LAG1 vs ACTUAL
+# Latest 3 origin cuts: future-week PLAN vs prior-week LAG1 vs later-cut ACTUAL
 # Paste this whole file into ONE Jupyter cell and run.
 # No CSV files are written. Results are printed only.
 # ================================================================
@@ -244,27 +244,45 @@ def make_detail_for_cut(
     )
     selected = sorted(joint & oos0_asins)
 
-    # Determine H1/H2/H3 from the actual order_week values present in THIS
-    # origin snapshot. Do not assume a snapshot cut date equals order_week.
+    # ------------------------------------------------------------
+    # Correct business semantics
+    # ------------------------------------------------------------
+    # In the CURRENT origin snapshot:
+    #   - current order_week = latest order_week at or before data_cut
+    #   - next 1st order_week = H1 PLAN
+    #   - next 2nd order_week = H2 PLAN
+    #   - next 3rd order_week = H3 PLAN
     #
-    # Example:
-    #   data_cut = Friday 2026-05-23
-    #   origin snapshot future order_weeks may be:
-    #       2026-05-24, 2026-05-31, 2026-06-07
-    #   Those become H1, H2, H3 respectively.
-    future_order_weeks = sorted(
+    # The realized value for each target week is then read from:
+    #   - next snapshot for H1
+    #   - second next snapshot for H2
+    #   - third next snapshot for H3
+    #
+    # LAG1 for each target week is the immediately preceding order_week
+    # inside the CURRENT origin snapshot:
+    #   - H1 lag1 = current week
+    #   - H2 lag1 = H1 plan week
+    #   - H3 lag1 = H2 plan week
+
+    distinct_weeks = sorted(
         pd.Timestamp(x).normalize()
-        for x in origin.loc[
-            origin["order_week"].notna()
-            & (origin["order_week"] > data_cut),
-            "order_week",
-        ].drop_duplicates()
+        for x in origin["order_week"].dropna().drop_duplicates()
     )
+
+    current_candidates = [w for w in distinct_weeks if w <= data_cut]
+    if not current_candidates:
+        raise RuntimeError(
+            f"Origin cut {data_cut.date()} has no order_week at or before data_cut."
+        )
+
+    current_order_week = current_candidates[-1]
+    future_order_weeks = [w for w in distinct_weeks if w > current_order_week]
 
     if len(future_order_weeks) < 3:
         raise RuntimeError(
-            f"Origin cut {data_cut.date()} has only "
-            f"{len(future_order_weeks)} future order_week values; need at least 3."
+            f"Origin cut {data_cut.date()} has current_order_week="
+            f"{current_order_week.date()} but only {len(future_order_weeks)} "
+            "future order_week values; need at least 3."
         )
 
     target_week_by_h = {
@@ -273,7 +291,13 @@ def make_detail_for_cut(
         3: future_order_weeks[2],
     }
 
-    # PLAN: values for those H1/H2/H3 target weeks in this origin snapshot.
+    lag1_week_by_h = {
+        1: current_order_week,
+        2: target_week_by_h[1],
+        3: target_week_by_h[2],
+    }
+
+    # PLAN: H1/H2/H3 values already present in this origin snapshot.
     plan_rows = origin[
         origin["asin"].isin(selected)
         & origin["order_week"].isin(target_week_by_h.values())
@@ -284,47 +308,20 @@ def make_detail_for_cut(
         {week: h for h, week in target_week_by_h.items()}
     )
 
-    # LAG1 baseline:
-    # for each horizon, use the immediately previous available order_week in
-    # the CURRENT origin snapshot for the same ASIN. Thus H2 lag1 is based on
-    # the week immediately preceding H2, not automatically the origin week.
-    origin_selected = origin[
-        origin["asin"].isin(selected)
-        & origin["order_week"].notna()
-    ].sort_values(["asin", "order_week"]).copy()
-
+    # LAG1: for each horizon, use the immediately preceding order_week
+    # from the same origin snapshot.
     lag_parts = []
     for h in [1, 2, 3]:
-        target_week = target_week_by_h[h]
+        lag_week = lag1_week_by_h[h]
 
-        # All rows strictly before this horizon's target week.
-        prior = origin_selected[
-            origin_selected["order_week"] < target_week
+        lag_rows = origin[
+            origin["asin"].isin(selected)
+            & origin["order_week"].eq(lag_week)
         ].copy()
 
-        # Pick latest row per ASIN before target_week. This naturally produces
-        # H1/H2/H3-specific lag1 values.
-        prior_latest = (
-            prior.sort_values(["asin", "order_week"])
-            .groupby("asin", as_index=False)
-            .tail(1)
-        )
-
-        lag_part = prior_latest[
-            [
-                "asin",
-                "order_week",
-                "ind_promotion",
-                "promotion_pricing_amount",
-                "pricing_type",
-            ]
-        ].rename(
-            columns={
-                "order_week": "lag1_source_week",
-                "ind_promotion": "lag1_ind_promotion",
-                "promotion_pricing_amount": "lag1_promotion_pricing_amount",
-                "pricing_type": "lag1_pricing_type",
-            }
+        lag_part = collapse_asin_week(lag_rows, "lag1")
+        lag_part = lag_part.rename(
+            columns={"order_week": "lag1_source_week"}
         )
         lag_part["horizon"] = h
         lag_parts.append(lag_part)
@@ -382,7 +379,9 @@ def make_detail_for_cut(
         "chris_jit_joint": len(joint),
         "scot_oos0": len(selected),
         "scot_col": scot_col,
+        "current_order_week": current_order_week,
         "target_week_by_h": target_week_by_h,
+        "lag1_week_by_h": lag1_week_by_h,
         "plan_rows_found": int(len(plan_rows)),
         "actual_rows_found_by_h": {
             h: int(len(actual_raw_by_h[h][
@@ -667,7 +666,7 @@ def run_analysis():
     )
 
     print("=" * 110)
-    print("JOINT Chris ∩ JIT ∩ scot_oos=0 | PLAN vs LAG1 vs ACTUAL")
+    print("JOINT Chris ∩ JIT ∩ scot_oos=0 | FUTURE PLAN vs LAG1 vs LATER-CUT ACTUAL")
     print("=" * 110)
     print(
         f"Chris={len(chris_set):,} | "
@@ -724,13 +723,23 @@ def run_analysis():
         )
 
         print(
-            f"CUT {cut_i + 1}: origin={data_cut.date()} | "
-            f"H1 target={pd.Timestamp(target_map[1]).date()} "
-            f"(actual snapshot={actual_cut_by_h[1].date()}) | "
-            f"H2 target={pd.Timestamp(target_map[2]).date()} "
-            f"(actual snapshot={actual_cut_by_h[2].date()}) | "
-            f"H3 target={pd.Timestamp(target_map[3]).date()} "
-            f"(actual snapshot={actual_cut_by_h[3].date()})"
+            f"CUT {cut_i + 1}: snapshot={data_cut.date()} | "
+            f"current_order_week={pd.Timestamp(cohort_info['current_order_week']).date()}"
+        )
+        print(
+            f"  H1 PLAN week={pd.Timestamp(target_map[1]).date()} | "
+            f"LAG1 week={pd.Timestamp(cohort_info['lag1_week_by_h'][1]).date()} | "
+            f"ACTUAL snapshot={actual_cut_by_h[1].date()}"
+        )
+        print(
+            f"  H2 PLAN week={pd.Timestamp(target_map[2]).date()} | "
+            f"LAG1 week={pd.Timestamp(cohort_info['lag1_week_by_h'][2]).date()} | "
+            f"ACTUAL snapshot={actual_cut_by_h[2].date()}"
+        )
+        print(
+            f"  H3 PLAN week={pd.Timestamp(target_map[3]).date()} | "
+            f"LAG1 week={pd.Timestamp(cohort_info['lag1_week_by_h'][3]).date()} | "
+            f"ACTUAL snapshot={actual_cut_by_h[3].date()}"
         )
         print(
             f"Cohort: origin ASIN={cohort_info['origin_asins']:,} | "
