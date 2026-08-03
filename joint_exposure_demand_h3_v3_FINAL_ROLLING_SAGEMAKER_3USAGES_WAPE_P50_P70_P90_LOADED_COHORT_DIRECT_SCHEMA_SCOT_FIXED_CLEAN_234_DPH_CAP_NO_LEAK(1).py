@@ -2918,9 +2918,12 @@ class DynamicSignedGraphMessage(nn.Module):
     dynamically assign neutral/positive/competitive probabilities at each FCD.
     The sampled shared z enters message values, not candidate selection.
     """
-    def __init__(self, d_model=32, d_z=16, horizon=3, hidden=64):
+    def __init__(self, d_model=32, d_z=16, horizon=3, hidden=64,
+                 neutral_threshold=0.50, gate_temperature=0.10):
         super().__init__()
         self.horizon = horizon
+        self.neutral_threshold = float(neutral_threshold)
+        self.gate_temperature = float(gate_temperature)
         self.activity_head = nn.Linear(d_model, 1)
         edge_dim = 4 * d_model + 1
         self.edge_net = nn.Sequential(
@@ -2957,16 +2960,34 @@ class DynamicSignedGraphMessage(nn.Module):
         pair_gate = 1.0 - (1.0 - target_active[:, None]) * (1.0 - peer_active)
         valid = peer_mask.float()
 
-        pos_w = relation_prob[..., 1] * pair_gate * valid
-        neg_w = relation_prob[..., 2] * pair_gate * valid
-        pos_w = pos_w / pos_w.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        neg_w = neg_w / neg_w.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        # Neutral is an edge-rejection class, never a message channel. During
+        # training use a differentiable gate; at inference use the exact hard
+        # threshold used by effective-neighbor diagnostics.
+        relation_confidence = 1.0 - relation_prob[..., 0]
+        if self.training:
+            edge_gate = torch.sigmoid(
+                (relation_confidence - self.neutral_threshold)
+                / max(self.gate_temperature, 1e-4)
+            )
+        else:
+            edge_gate = (relation_confidence >= self.neutral_threshold).float()
+        edge_gate = edge_gate * valid
+
+        pos_raw = relation_prob[..., 1] * pair_gate * edge_gate
+        neg_raw = relation_prob[..., 2] * pair_gate * edge_gate
+        pos_w = pos_raw / pos_raw.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        neg_w = neg_raw / neg_raw.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+        # Preserve total evidence. Without this strength term, normalization
+        # would amplify several 0.01-probability edges into a full message.
+        pos_strength = 1.0 - torch.prod(1.0 - pos_raw.clamp(0.0, 1.0), dim=1)
+        neg_strength = 1.0 - torch.prod(1.0 - neg_raw.clamp(0.0, 1.0), dim=1)
 
         z_peer = self.z_proj(z)[:, None, :].expand_as(peer_phi)
         pos_value = self.pos_value(torch.cat([peer_phi, z_peer], dim=-1))
         neg_value = self.neg_value(torch.cat([peer_phi, z_peer], dim=-1))
-        pos_msg = torch.sum(pos_w.unsqueeze(-1) * pos_value, dim=1)
-        neg_msg = torch.sum(neg_w.unsqueeze(-1) * neg_value, dim=1)
+        pos_msg = torch.sum(pos_w.unsqueeze(-1) * pos_value, dim=1) * pos_strength[:, None]
+        neg_msg = torch.sum(neg_w.unsqueeze(-1) * neg_value, dim=1) * neg_strength[:, None]
         message = self.message_out(torch.cat([target_phi, pos_msg, neg_msg], dim=-1))
         return {
             "mu_residual": self.mu_head(message),
@@ -2976,6 +2997,12 @@ class DynamicSignedGraphMessage(nn.Module):
             "relation_logits": relation_logits,
             "positive_weight": pos_w,
             "competitive_weight": neg_w,
+            "edge_gate": edge_gate,
+            "relation_confidence": relation_confidence,
+            "positive_strength": pos_strength,
+            "competitive_strength": neg_strength,
+            "positive_message_norm": torch.linalg.vector_norm(pos_msg, dim=-1),
+            "competitive_message_norm": torch.linalg.vector_norm(neg_msg, dim=-1),
         }
 
 
@@ -2995,7 +3022,9 @@ class JointExposureDemandH3(nn.Module):
     def __init__(self, input_dim, context_dim, d_model=32, d_z=16,
                  horizon=3, prior_scale=0.3,
                  detach_exposure_for_demand=False,
-                 graph_variant="legacy"):
+                 graph_variant="legacy",
+                 graph_neutral_threshold=0.50,
+                 graph_gate_temperature=0.10):
         super().__init__()
         if horizon != 3:
             raise ValueError("This experimental file is intentionally H3 only.")
@@ -3063,7 +3092,11 @@ class JointExposureDemandH3(nn.Module):
         )
         self.decoder_epinet_scale = 0.35
         self.dynamic_graph = (
-            DynamicSignedGraphMessage(d_model=d_model, d_z=d_z, horizon=horizon)
+            DynamicSignedGraphMessage(
+                d_model=d_model, d_z=d_z, horizon=horizon,
+                neutral_threshold=graph_neutral_threshold,
+                gate_temperature=graph_gate_temperature,
+            )
             if self.graph_variant == "dynamic_signed" else None
         )
 
@@ -3439,8 +3472,12 @@ def compute_dynamic_graph_diagnostics(model, va_ld):
         return {}
     totals = {
         "graph_candidate_edges": 0.0, "graph_rank_eligible_edges": 0.0,
+        "graph_effective_edges": 0.0, "graph_positive_edges": 0.0,
+        "graph_competitive_edges": 0.0, "graph_target_asins": 0.0,
         "graph_positive_prob": 0.0, "graph_competitive_prob": 0.0,
         "graph_neutral_prob": 0.0, "graph_edge_entropy": 0.0,
+        "graph_positive_message_norm": 0.0,
+        "graph_competitive_message_norm": 0.0,
     }
     model.eval()
     with torch.no_grad():
@@ -3452,13 +3489,22 @@ def compute_dynamic_graph_diagnostics(model, va_ld):
                 peer_static=b["peer_static"],
             )
             prob = torch.softmax(out["relation_logits"], dim=-1)
+            graph0 = out["graph_outputs"][0]
             mask = b["peer_mask"] > 0
+            effective = graph0["edge_gate"] > 0
+            relation_class = prob.argmax(dim=-1)
             target_active = b["y"].sum(dim=-1) > 0
             peer_active = b["peer_y"].sum(dim=-1) > 0
             rank_mask = mask & (target_active[:, None] | peer_active)
             n = mask.float().sum()
             totals["graph_candidate_edges"] += float(n.item())
             totals["graph_rank_eligible_edges"] += float(rank_mask.float().sum().item())
+            totals["graph_effective_edges"] += float(effective.float().sum().item())
+            totals["graph_positive_edges"] += float((effective & (relation_class == 1)).float().sum().item())
+            totals["graph_competitive_edges"] += float((effective & (relation_class == 2)).float().sum().item())
+            totals["graph_target_asins"] += float(b["y"].shape[0])
+            totals["graph_positive_message_norm"] += float(graph0["positive_message_norm"].sum().item())
+            totals["graph_competitive_message_norm"] += float(graph0["competitive_message_norm"].sum().item())
             if n.item() > 0:
                 totals["graph_neutral_prob"] += float((prob[..., 0] * mask).sum().item())
                 totals["graph_positive_prob"] += float((prob[..., 1] * mask).sum().item())
@@ -3469,6 +3515,13 @@ def compute_dynamic_graph_diagnostics(model, va_ld):
     for key in ["graph_neutral_prob", "graph_positive_prob", "graph_competitive_prob", "graph_edge_entropy"]:
         totals[key] /= denom
     totals["graph_rank_eligible_rate"] = totals["graph_rank_eligible_edges"] / denom
+    target_denom = max(totals["graph_target_asins"], 1.0)
+    totals["graph_mean_candidate_neighbors"] = totals["graph_candidate_edges"] / target_denom
+    totals["graph_mean_effective_neighbors"] = totals["graph_effective_edges"] / target_denom
+    totals["graph_mean_positive_neighbors"] = totals["graph_positive_edges"] / target_denom
+    totals["graph_mean_competitive_neighbors"] = totals["graph_competitive_edges"] / target_denom
+    totals["graph_positive_message_norm"] /= target_denom
+    totals["graph_competitive_message_norm"] /= target_denom
     return totals
 
 
@@ -3604,6 +3657,8 @@ def run_joint_exposure_demand_h3_end2end(
     graph_variant="legacy",
     dynamic_graph_top_k=10,
     dynamic_graph_min_similarity=0.55,
+    graph_neutral_threshold=0.50,
+    graph_gate_temperature=0.10,
     lambda_graph_aux=0.10,
 ):
     """Run non-rolling H3 joint model on one snapshot.
@@ -3627,7 +3682,8 @@ def run_joint_exposure_demand_h3_end2end(
     print(f"Demand gradient through exposure_hat: {not detach_exposure_for_demand}")
     print(
         f"Graph variant: {graph_variant} | dynamic max-K: {dynamic_graph_top_k} | "
-        f"minimum static similarity: {dynamic_graph_min_similarity} | DEVICE: {DEVICE}"
+        f"minimum static similarity: {dynamic_graph_min_similarity} | "
+        f"neutral threshold: {graph_neutral_threshold} | DEVICE: {DEVICE}"
     )
     print("=" * 88)
 
@@ -3756,6 +3812,8 @@ def run_joint_exposure_demand_h3_end2end(
         prior_scale=0.3,
         detach_exposure_for_demand=detach_exposure_for_demand,
         graph_variant=graph_variant,
+        graph_neutral_threshold=graph_neutral_threshold,
+        graph_gate_temperature=graph_gate_temperature,
     ).to(DEVICE)
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     print(f"Training on: {DEVICE}")
@@ -4352,6 +4410,8 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     graph_variant="legacy",
     dynamic_graph_top_k=10,
     dynamic_graph_min_similarity=0.55,
+    graph_neutral_threshold=0.50,
+    graph_gate_temperature=0.10,
     lambda_graph_aux=0.10,
 ):
     """
@@ -4435,7 +4495,8 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     print("Metrics retained: P50, P70, and P90")
     print(
         f"Graph variant: {graph_variant} | dynamic max-K: {dynamic_graph_top_k} | "
-        f"minimum static similarity: {dynamic_graph_min_similarity} | DEVICE: {DEVICE}"
+        f"minimum static similarity: {dynamic_graph_min_similarity} | "
+        f"neutral threshold: {graph_neutral_threshold} | DEVICE: {DEVICE}"
     )
     print(
         "WAPE: calls original calculate_wape_using_lp_oos2 "
@@ -4753,6 +4814,8 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                     graph_variant=graph_variant,
                     dynamic_graph_top_k=dynamic_graph_top_k,
                     dynamic_graph_min_similarity=dynamic_graph_min_similarity,
+                    graph_neutral_threshold=graph_neutral_threshold,
+                    graph_gate_temperature=graph_gate_temperature,
                     lambda_graph_aux=lambda_graph_aux,
                 )
 
@@ -5067,6 +5130,18 @@ def run_dynamic_vs_legacy_graph_comparison(
     comparison_path = root / "graph_comparison_summary.csv"
     root.mkdir(parents=True, exist_ok=True)
     comparison.to_csv(comparison_path, index=False)
+
+    print("\n" + "=" * 120)
+    print("FINAL GRAPH COMPARISON SUMMARY | DYNAMIC SIGNED FIRST, LEGACY SECOND")
+    print("=" * 120)
+    with pd.option_context(
+        "display.max_columns", None,
+        "display.max_rows", None,
+        "display.width", 240,
+        "display.max_colwidth", 40,
+    ):
+        print(comparison.to_string(index=False))
+    print("=" * 120)
     print(f"Graph comparison summary saved: {comparison_path}")
     return {
         "comparison": comparison,
@@ -5103,6 +5178,8 @@ run_legacy_vs_dynamic_graph_comparison = run_dynamic_vs_legacy_graph_comparison
 #     lambda_exposure=0.50,
 #     dynamic_graph_top_k=10,
 #     dynamic_graph_min_similarity=0.55,
+#     graph_neutral_threshold=0.50,
+#     graph_gate_temperature=0.10,
 #     lambda_graph_aux=0.10,
 #     detach_exposure_for_demand=False,
 #     remove_oos_dp=True,
