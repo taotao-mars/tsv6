@@ -33,6 +33,27 @@ from sklearn.metrics import roc_auc_score
 torch.manual_seed(42)
 np.random.seed(42)
 
+# =============================================================================
+# CHRIS-JIT PATCH SWITCH
+#
+# Controls the fallback used for ind_promotion / promotion_pricing_amount /
+# pricing_type on H1/H2/H3 rows when origin_raw has no value for that
+# (asin, order_week).
+#
+#   False (default) -> leave as NaN. Downstream _safe_numeric() then fills
+#                       these with 0.0, i.e. "no promo/pricing signal known
+#                       at the origin cut."
+#   True             -> fill with the origin cut's own last known value per
+#                        ASIN (a real lag1, computed inside the rolling loop
+#                        itself, since DemandDataset's built-in lag1 logic
+#                        never actually fires here -- see the rolling loop
+#                        comment near the ORIGIN-PLAN-PATCH block for why).
+#
+# Flip to True only after you've decided lag1 is the right call for these
+# three fields.
+# =============================================================================
+ORIGIN_PLAN_LAG1_FALLBACK_ENABLED = False
+
 print(
     "[VERSION] v3 CHRIS-JIT | promotion future features removed | "
     "history-only preprocessing | no extreme-ASIN filter | isolated outputs",
@@ -4398,6 +4419,147 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 "Expected H1/H2/H3:",
                 [expected_h1, expected_h2, expected_h3],
             )
+
+            # ------------------------------------------------------------
+            # CHRIS-JIT PATCH: origin-known plan values for H1/H2/H3.
+            #
+            # By default data_raw1 (built above from eval_raw) carries the
+            # LATER evaluation snapshot's realized values for every column,
+            # including ind_promotion / promotion_pricing_amount /
+            # pricing_type. For H1/H2/H3 rows specifically, that means the
+            # model would see the post-hoc actual promo/pricing outcome
+            # instead of what was actually knowable at the origin cut.
+            #
+            # This block overwrites ONLY those three columns, and ONLY for
+            # rows whose order_week is exactly H1/H2/H3, with the value
+            # already present in origin_raw (the current cut) for that same
+            # (asin, order_week).
+            #
+            # NOTE on fallback: DemandDataset._make_future_context_with_dph_proxies
+            # has its own lag1 logic (checks np.isfinite on plan_values), but
+            # load_real_data's _safe_numeric step already fills every NaN in
+            # context_cols with 0.0 BEFORE DemandDataset ever sees the data,
+            # so that built-in lag1 branch never actually fires for these
+            # columns. To make ORIGIN_PLAN_LAG1_FALLBACK_ENABLED do anything
+            # real, the lag1 fill (when enabled) happens right here, before
+            # data_raw1 reaches load_real_data.
+            #
+            # Nothing else about data_raw1, context_cols, load_real_data,
+            # or DemandDataset is changed.
+            # ------------------------------------------------------------
+            _ORIGIN_PLAN_COLS = [
+                "ind_promotion",
+                "promotion_pricing_amount",
+                "pricing_type",
+            ]
+            _origin_plan_cols_present = [
+                c for c in _ORIGIN_PLAN_COLS if c in origin_raw.columns
+            ]
+
+            if _origin_plan_cols_present:
+                _target_weeks = {expected_h1, expected_h2, expected_h3}
+
+                origin_plan_lookup = (
+                    origin_raw[origin_raw["asin"].isin(rolling_asins)]
+                    [["asin", "order_week"] + _origin_plan_cols_present]
+                    .dropna(subset=["asin", "order_week"])
+                    .drop_duplicates(subset=["asin", "order_week"], keep="last")
+                    .rename(
+                        columns={
+                            c: f"__origin_plan__{c}"
+                            for c in _origin_plan_cols_present
+                        }
+                    )
+                )
+
+                data_raw1 = data_raw1.merge(
+                    origin_plan_lookup,
+                    on=["asin", "order_week"],
+                    how="left",
+                )
+
+                if ORIGIN_PLAN_LAG1_FALLBACK_ENABLED:
+                    # Real lag1: the origin cut's own last known value per
+                    # ASIN, i.e. the most recent origin_raw row at or before
+                    # the origin cut date itself.
+                    origin_lag1_lookup = (
+                        origin_raw[
+                            origin_raw["asin"].isin(rolling_asins)
+                            & (origin_raw["order_week"] <= data_cut)
+                        ]
+                        .sort_values(["asin", "order_week"])
+                        .groupby("asin", as_index=False)
+                        .last()
+                        [["asin"] + _origin_plan_cols_present]
+                        .rename(
+                            columns={
+                                c: f"__origin_lag1__{c}"
+                                for c in _origin_plan_cols_present
+                            }
+                        )
+                    )
+                    data_raw1 = data_raw1.merge(
+                        origin_lag1_lookup,
+                        on="asin",
+                        how="left",
+                    )
+
+                _is_target_week = data_raw1["order_week"].isin(_target_weeks)
+                _overwritten_rows = 0
+                _lag1_filled_rows = 0
+
+                for c in _origin_plan_cols_present:
+                    origin_col = f"__origin_plan__{c}"
+                    has_origin_value = data_raw1[origin_col].notna()
+
+                    if c not in data_raw1.columns:
+                        data_raw1[c] = np.nan
+
+                    # H1-H3 rows: drop whatever eval_raw supplied first, so a
+                    # miss never silently keeps the post-hoc realized value.
+                    data_raw1.loc[_is_target_week, c] = np.nan
+
+                    overwrite_mask = _is_target_week & has_origin_value
+                    _overwritten_rows += int(overwrite_mask.sum())
+                    data_raw1.loc[overwrite_mask, c] = data_raw1.loc[
+                        overwrite_mask, origin_col
+                    ]
+                    data_raw1 = data_raw1.drop(columns=[origin_col])
+
+                    if ORIGIN_PLAN_LAG1_FALLBACK_ENABLED:
+                        lag1_col = f"__origin_lag1__{c}"
+                        still_missing = _is_target_week & data_raw1[c].isna()
+                        has_lag1_value = data_raw1[lag1_col].notna()
+                        fill_mask = still_missing & has_lag1_value
+                        _lag1_filled_rows += int(fill_mask.sum())
+                        data_raw1.loc[fill_mask, c] = data_raw1.loc[
+                            fill_mask, lag1_col
+                        ]
+                        data_raw1 = data_raw1.drop(columns=[lag1_col])
+
+                _rows_per_col = int(_is_target_week.sum())
+                _still_zero_filled = (
+                    (_rows_per_col * len(_origin_plan_cols_present))
+                    - _overwritten_rows
+                    - _lag1_filled_rows
+                )
+                print(
+                    f"[ORIGIN-PLAN-PATCH] cols={_origin_plan_cols_present} | "
+                    f"lag1_fallback={'ON' if ORIGIN_PLAN_LAG1_FALLBACK_ENABLED else 'OFF'} | "
+                    f"H1-H3 rows filled from origin cut={_overwritten_rows:,} | "
+                    f"H1-H3 rows filled via lag1={_lag1_filled_rows:,} | "
+                    f"H1-H3 rows left for _safe_numeric->0.0={_still_zero_filled:,}",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[ORIGIN-PLAN-PATCH] none of ind_promotion / "
+                    "promotion_pricing_amount / pricing_type found in "
+                    "origin_raw; H1-H3 values remain sourced from eval_raw "
+                    "for these columns.",
+                    flush=True,
+                )
+
             print("Joint cohort sampled ASINs:", len(rolling_asins))
             print("SCOT ASINs:", len(scot_set))
             print("Evaluation ASINs:", len(eval_set))
