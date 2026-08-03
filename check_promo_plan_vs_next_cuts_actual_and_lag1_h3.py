@@ -1,8 +1,23 @@
 # ================================================================
-# JOINT Chris ∩ JIT ∩ scot_oos=0
-# Latest 3 origin cuts: future-week PLAN vs prior-week LAG1 vs later-cut ACTUAL
-# Paste this whole file into ONE Jupyter cell and run.
-# No CSV files are written. Results are printed only.
+# CHECK CURRENT-CUT H1/H2/H3 PLAN VS FUTURE REALIZED VALUES
+#
+# Standalone analysis only. It does NOT import or run the forecasting model.
+#
+# Business semantics:
+#   Origin cut i:
+#     - the last 3 distinct order_week values in the origin snapshot are H1/H2/H3 plans
+#     - the immediately preceding distinct order_week is the current/actual week
+#
+#   Realized values:
+#     - H1 actual comes from cut i+1, matched by ASIN + original H1 order_week
+#     - H2 actual comes from cut i+2, matched by ASIN + original H2 order_week
+#     - H3 actual comes from cut i+3, matched by ASIN + original H3 order_week
+#
+# Cohort:
+#   Chris ∩ JIT ∩ current-cut scot_oos=0
+#
+# Output:
+#   Prints metrics and examples only. No files are saved.
 # ================================================================
 
 import io
@@ -14,9 +29,9 @@ import numpy as np
 import pandas as pd
 
 
-# -----------------------------
+# ----------------------------------------------------------------
 # CONFIG
-# -----------------------------
+# ----------------------------------------------------------------
 BUCKET = "amxl-asin-forecast590184089576"
 DATA_PREFIX = (
     "amxl-asin-forecast-intern/data_for_model/"
@@ -26,16 +41,22 @@ DATA_PREFIX = (
 CHRIS_CSV = "asin_list_from_amxl_fcst_scot_to_chris_20260723.csv"
 JIT_CSV = "jit_asin_list_from_Hrishi_20270727.csv"
 
-MAX_CUTS = 3
+# Latest N valid origin cuts to analyze.
+MAX_VALID_ORIGIN_CUTS = 3
+
+# Number of largest-gap ASIN examples printed for each field/horizon.
 TOP_ASINS_TO_PRINT = 10
 
 JIT_EXCLUDED_ASINS = {"B01FV0F13E", "B073H7VJ37"}
 
-FIELDS = [
+PLAN_FIELDS = [
     "ind_promotion",
     "promotion_pricing_amount",
     "pricing_type",
 ]
+
+# pricing_type is categorical. The other two are evaluated numerically.
+CATEGORICAL_FIELDS = {"pricing_type"}
 
 SCOT_OOS_CANDIDATES = [
     "scot_oos",
@@ -47,112 +68,38 @@ SCOT_OOS_CANDIDATES = [
 ]
 
 
-# -----------------------------
-# S3 / snapshot helpers
-# -----------------------------
-def list_s3_keys(bucket, prefix, s3):
-    keys = []
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            if obj.get("Key"):
-                keys.append(obj["Key"])
-    return keys
-
-
-def list_snapshot_cuts(bucket, prefix, s3):
-    pattern = re.compile(
-        r"df_head_body_add_holiday_"
-        r"(\d{4}-\d{2}-\d{2})_?ETLM_[vV]3\.csv$"
-    )
-
-    rows = []
-    for key in list_s3_keys(bucket, prefix, s3):
-        m = pattern.search(key)
-        if m:
-            rows.append(
-                {
-                    "cut": pd.Timestamp(m.group(1)).normalize(),
-                    "key": key,
-                }
-            )
-
-    cuts = (
-        pd.DataFrame(rows)
-        .drop_duplicates("cut", keep="last")
-        .sort_values("cut")
-        .reset_index(drop=True)
-    )
-
-    if cuts.empty:
-        raise RuntimeError("No weekly snapshot files were found.")
-    return cuts
-
-
-def build_last3_origin_pairs(cuts):
-    rows = []
-    for i in range(len(cuts) - 3):
-        rows.append(
-            {
-                "data_cut": cuts.loc[i, "cut"],
-                "origin_key": cuts.loc[i, "key"],
-                "h1_cut": cuts.loc[i + 1, "cut"],
-                "h1_key": cuts.loc[i + 1, "key"],
-                "h2_cut": cuts.loc[i + 2, "cut"],
-                "h2_key": cuts.loc[i + 2, "key"],
-                "h3_cut": cuts.loc[i + 3, "cut"],
-                "h3_key": cuts.loc[i + 3, "key"],
-            }
-        )
-
-    pairs = pd.DataFrame(rows)
-    if pairs.empty:
-        raise RuntimeError("Not enough snapshots to form 3 future cuts.")
-    return pairs.sort_values("data_cut").reset_index(drop=True)
-
-
-def read_s3_csv_columns(bucket, key, wanted_columns, s3):
-    wanted = set(wanted_columns)
-    body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", pd.errors.DtypeWarning)
-        return pd.read_csv(
-            io.BytesIO(body),
-            usecols=lambda c: c in wanted,
-            low_memory=False,
-        )
+# ----------------------------------------------------------------
+# BASIC HELPERS
+# ----------------------------------------------------------------
+def normalize_string(series):
+    out = series.astype("string").str.strip()
+    return out.mask(out.isin(["", "nan", "None", "<NA>"]))
 
 
 def normalize_frame(df):
     out = df.copy()
-    out["asin"] = out["asin"].astype("string").str.strip()
+
+    required = {"asin", "order_week"}
+    missing = sorted(required - set(out.columns))
+    if missing:
+        raise ValueError("Snapshot missing required columns: " + ", ".join(missing))
+
+    out["asin"] = normalize_string(out["asin"])
     out["order_week"] = pd.to_datetime(
         out["order_week"], errors="coerce"
     ).dt.normalize()
-    return out
+
+    return out.dropna(subset=["asin", "order_week"])
 
 
-def normalize_string(s):
-    out = s.astype("string").str.strip()
-    return out.mask(out.isin(["", "nan", "None", "<NA>"]))
-
-
-def last_non_null(s):
-    v = s.dropna()
-    return v.iloc[-1] if len(v) else np.nan
+def last_non_null(series):
+    values = series.dropna()
+    return values.iloc[-1] if len(values) else np.nan
 
 
 def load_asin_set(path, excluded=None):
     df = pd.read_csv(path, usecols=["asin"])
-    result = set(
-        df["asin"]
-        .dropna()
-        .astype(str)
-        .str.strip()
-        .replace("", np.nan)
-        .dropna()
-    )
+    result = set(normalize_string(df["asin"]).dropna().astype(str))
     if excluded:
         result -= set(excluded)
     return result
@@ -168,139 +115,248 @@ def find_scot_oos_col(df):
     )
 
 
-# -----------------------------
-# One-cut construction
-# -----------------------------
-def collapse_asin_week(df, prefix):
-    if df.empty:
-        return pd.DataFrame(
-            columns=[
-                "asin",
-                "order_week",
-                f"{prefix}_ind_promotion",
-                f"{prefix}_promotion_pricing_amount",
-                f"{prefix}_pricing_type",
-            ]
+# ----------------------------------------------------------------
+# S3 SNAPSHOT HELPERS
+# ----------------------------------------------------------------
+def list_s3_keys(bucket, prefix, s3):
+    keys = []
+    paginator = s3.get_paginator("list_objects_v2")
+
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj.get("Key")
+            if key:
+                keys.append(key)
+
+    return keys
+
+
+def list_snapshot_cuts(bucket, prefix, s3):
+    pattern = re.compile(
+        r"df_head_body_add_holiday_"
+        r"(\d{4}-\d{2}-\d{2})_?ETLM_[vV]3\.csv$"
+    )
+
+    rows = []
+    for key in list_s3_keys(bucket, prefix, s3):
+        match = pattern.search(key)
+        if match:
+            rows.append(
+                {
+                    "cut": pd.Timestamp(match.group(1)).normalize(),
+                    "key": key,
+                }
+            )
+
+    cuts = (
+        pd.DataFrame(rows)
+        .drop_duplicates("cut", keep="last")
+        .sort_values("cut")
+        .reset_index(drop=True)
+    )
+
+    if cuts.empty:
+        raise RuntimeError(
+            "No snapshot files matched the expected V3 filename pattern."
         )
 
-    return (
-        df.sort_values(["asin", "order_week"])
-        .groupby(["asin", "order_week"], as_index=False)
-        .agg(
-            **{
-                f"{prefix}_ind_promotion": (
-                    "ind_promotion",
-                    last_non_null,
-                ),
-                f"{prefix}_promotion_pricing_amount": (
-                    "promotion_pricing_amount",
-                    last_non_null,
-                ),
-                f"{prefix}_pricing_type": (
-                    "pricing_type",
-                    last_non_null,
-                ),
+    if len(cuts) < 4:
+        raise RuntimeError(
+            f"Only {len(cuts)} snapshots found; at least 4 are required."
+        )
+
+    return cuts
+
+
+def build_origin_candidates(cuts):
+    """
+    Every candidate needs three later cuts:
+      origin i, H1 actual i+1, H2 actual i+2, H3 actual i+3.
+    """
+    rows = []
+
+    for i in range(len(cuts) - 3):
+        rows.append(
+            {
+                "origin_cut": cuts.loc[i, "cut"],
+                "origin_key": cuts.loc[i, "key"],
+                "h1_actual_cut": cuts.loc[i + 1, "cut"],
+                "h1_actual_key": cuts.loc[i + 1, "key"],
+                "h2_actual_cut": cuts.loc[i + 2, "cut"],
+                "h2_actual_key": cuts.loc[i + 2, "key"],
+                "h3_actual_cut": cuts.loc[i + 3, "cut"],
+                "h3_actual_key": cuts.loc[i + 3, "key"],
             }
         )
+
+    return pd.DataFrame(rows).sort_values(
+        "origin_cut", ascending=False
+    ).reset_index(drop=True)
+
+
+def read_s3_csv_columns(bucket, key, wanted_columns, s3):
+    body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    wanted = set(wanted_columns)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", pd.errors.DtypeWarning)
+        return pd.read_csv(
+            io.BytesIO(body),
+            usecols=lambda c: c in wanted,
+            low_memory=False,
+        )
+
+
+# ----------------------------------------------------------------
+# SNAPSHOT COLLAPSE / TARGET-WEEK LOGIC
+# ----------------------------------------------------------------
+def collapse_asin_week(df, prefix):
+    """
+    Collapse duplicate ASIN-week rows by taking the final non-null value
+    for each plan field.
+    """
+    output_cols = [
+        "asin",
+        "order_week",
+        *[f"{prefix}_{field}" for field in PLAN_FIELDS],
+    ]
+
+    if df.empty:
+        return pd.DataFrame(columns=output_cols)
+
+    work = df.copy()
+    for field in PLAN_FIELDS:
+        if field not in work.columns:
+            work[field] = np.nan
+
+    aggregations = {
+        f"{prefix}_{field}": (field, last_non_null)
+        for field in PLAN_FIELDS
+    }
+
+    return (
+        work.sort_values(["asin", "order_week"])
+        .groupby(["asin", "order_week"], as_index=False)
+        .agg(**aggregations)
     )
 
 
-def make_detail_for_cut(
-    origin_raw,
-    actual_raw_by_h,
-    data_cut,
-    actual_cut_by_h,
+def infer_current_and_horizon_weeks(origin):
+    """
+    The origin snapshot already contains:
+      ... historical/current weeks, H1 plan, H2 plan, H3 plan.
+
+    Therefore:
+      current week = fourth distinct order_week from the end
+      H1/H2/H3     = final three distinct order_week values
+
+    This deliberately does NOT compare order_week with the snapshot cut date,
+    because their date anchors may differ.
+    """
+    weeks = sorted(origin["order_week"].dropna().unique())
+
+    if len(weeks) < 4:
+        return None
+
+    return {
+        "current": pd.Timestamp(weeks[-4]).normalize(),
+        1: pd.Timestamp(weeks[-3]).normalize(),
+        2: pd.Timestamp(weeks[-2]).normalize(),
+        3: pd.Timestamp(weeks[-1]).normalize(),
+    }
+
+
+def determine_selected_asins(
+    origin,
+    current_order_week,
     chris_set,
     jit_set,
 ):
-    origin = normalize_frame(origin_raw)
-    actuals = {h: normalize_frame(df) for h, df in actual_raw_by_h.items()}
+    """
+    Chris ∩ JIT ∩ current-cut scot_oos=0.
 
+    scot_oos is taken from the latest origin-snapshot row at or before
+    current_order_week for each ASIN.
+    """
     scot_col = find_scot_oos_col(origin)
 
-    # 1) Joint cohort.
-    origin_asins = set(origin["asin"].dropna())
+    origin_asins = set(origin["asin"].dropna().astype(str))
     joint = origin_asins & chris_set & jit_set
 
-    # 2) Filter scot_oos=0 using latest row at or before origin cut.
     scot_hist = origin[
         origin["asin"].isin(joint)
-        & origin["order_week"].notna()
-        & (origin["order_week"] <= data_cut)
+        & (origin["order_week"] <= current_order_week)
     ][["asin", "order_week", scot_col]].copy()
 
     scot_hist[scot_col] = pd.to_numeric(
         scot_hist[scot_col], errors="coerce"
     )
 
-    scot_at_cut = (
+    latest_scot = (
         scot_hist.sort_values(["asin", "order_week"])
         .groupby("asin", as_index=False)
         .tail(1)
     )
 
-    oos0_asins = set(
-        scot_at_cut.loc[scot_at_cut[scot_col].eq(0), "asin"]
-    )
-    selected = sorted(joint & oos0_asins)
-
-    # ------------------------------------------------------------
-    # Correct business semantics
-    # ------------------------------------------------------------
-    # In the CURRENT origin snapshot:
-    #   - current order_week = latest order_week at or before data_cut
-    #   - next 1st order_week = H1 PLAN
-    #   - next 2nd order_week = H2 PLAN
-    #   - next 3rd order_week = H3 PLAN
-    #
-    # The realized value for each target week is then read from:
-    #   - next snapshot for H1
-    #   - second next snapshot for H2
-    #   - third next snapshot for H3
-    #
-    # LAG1 for each target week is the immediately preceding order_week
-    # inside the CURRENT origin snapshot:
-    #   - H1 lag1 = current week
-    #   - H2 lag1 = H1 plan week
-    #   - H3 lag1 = H2 plan week
-
-    distinct_weeks = sorted(
-        pd.Timestamp(x).normalize()
-        for x in origin["order_week"].dropna().drop_duplicates()
+    selected = sorted(
+        set(latest_scot.loc[latest_scot[scot_col].eq(0), "asin"])
     )
 
-    current_candidates = [w for w in distinct_weeks if w <= data_cut]
-    if not current_candidates:
-        raise RuntimeError(
-            f"Origin cut {data_cut.date()} has no order_week at or before data_cut."
-        )
-
-    current_order_week = current_candidates[-1]
-    future_order_weeks = [w for w in distinct_weeks if w > current_order_week]
-
-    if len(future_order_weeks) < 3:
-        return None, {
-            "skip_reason": (
-                f"current_order_week={current_order_week.date()} has only "
-                f"{len(future_order_weeks)} future order_week values"
-            ),
-            "current_order_week": current_order_week,
-            "future_week_count": len(future_order_weeks),
-        }
-
-    target_week_by_h = {
-        1: future_order_weeks[0],
-        2: future_order_weeks[1],
-        3: future_order_weeks[2],
+    return selected, {
+        "origin_asins": len(origin_asins),
+        "chris_jit_joint": len(joint),
+        "scot_oos0_selected": len(selected),
+        "scot_oos_col": scot_col,
     }
 
+
+# ----------------------------------------------------------------
+# BUILD ASIN × HORIZON DETAIL
+# ----------------------------------------------------------------
+def build_detail_for_origin(
+    origin_raw,
+    actual_raw_by_h,
+    origin_cut,
+    actual_cut_by_h,
+    chris_set,
+    jit_set,
+):
+    origin = normalize_frame(origin_raw)
+    actuals = {
+        h: normalize_frame(df)
+        for h, df in actual_raw_by_h.items()
+    }
+
+    week_map = infer_current_and_horizon_weeks(origin)
+    if week_map is None:
+        return None, {
+            "skip_reason": "origin snapshot has fewer than 4 distinct order_week values"
+        }
+
+    current_week = week_map["current"]
+    target_week_by_h = {h: week_map[h] for h in [1, 2, 3]}
+
+    # H1 lag1 = current week; H2 lag1 = H1 plan week; H3 lag1 = H2 plan week.
     lag1_week_by_h = {
-        1: current_order_week,
+        1: current_week,
         2: target_week_by_h[1],
         3: target_week_by_h[2],
     }
 
-    # PLAN: H1/H2/H3 values already present in this origin snapshot.
+    selected, cohort_info = determine_selected_asins(
+        origin=origin,
+        current_order_week=current_week,
+        chris_set=chris_set,
+        jit_set=jit_set,
+    )
+
+    if not selected:
+        return None, {
+            **cohort_info,
+            "skip_reason": "Chris ∩ JIT ∩ scot_oos=0 cohort is empty",
+        }
+
+    # Current-cut PLAN values.
     plan_rows = origin[
         origin["asin"].isin(selected)
         & origin["order_week"].isin(target_week_by_h.values())
@@ -311,34 +367,37 @@ def make_detail_for_cut(
         {week: h for h, week in target_week_by_h.items()}
     )
 
-    # LAG1: for each horizon, use the immediately preceding order_week
-    # from the same origin snapshot.
+    # Current-cut LAG1 values.
     lag_parts = []
     for h in [1, 2, 3]:
         lag_week = lag1_week_by_h[h]
-
-        lag_rows = origin[
+        rows = origin[
             origin["asin"].isin(selected)
             & origin["order_week"].eq(lag_week)
         ].copy()
 
-        lag_part = collapse_asin_week(lag_rows, "lag1")
-        lag_part = lag_part.rename(
-            columns={"order_week": "lag1_source_week"}
-        )
-        lag_part["horizon"] = h
-        lag_parts.append(lag_part)
+        part = collapse_asin_week(rows, "lag1")
+        part = part.rename(columns={"order_week": "lag1_source_week"})
+        part["horizon"] = h
+        lag_parts.append(part)
 
     lag1 = pd.concat(lag_parts, ignore_index=True)
 
-    # ACTUAL: same target order_week, read from the corresponding later cut.
+    # Future realized values.
+    # Each horizon uses its corresponding future cut, but matches the ORIGINAL
+    # target order_week exactly.
     actual_parts = []
+    actual_match_rows = {}
+
     for h in [1, 2, 3]:
         target_week = target_week_by_h[h]
+
         rows = actuals[h][
             actuals[h]["asin"].isin(selected)
             & actuals[h]["order_week"].eq(target_week)
         ].copy()
+
+        actual_match_rows[h] = len(rows)
 
         part = collapse_asin_week(rows, "actual")
         part["horizon"] = h
@@ -347,7 +406,7 @@ def make_detail_for_cut(
 
     actual = pd.concat(actual_parts, ignore_index=True)
 
-    # Fixed ASIN × H1/H2/H3 grid. Missing values remain NaN.
+    # Fixed grid preserves missing PLAN/ACTUAL/LAG1 rows.
     grid = pd.MultiIndex.from_product(
         [selected, [1, 2, 3]],
         names=["asin", "horizon"],
@@ -362,88 +421,93 @@ def make_detail_for_cut(
             left_on=["asin", "target_week", "horizon"],
             right_on=["asin", "order_week", "horizon"],
             how="left",
+            validate="one_to_one",
         )
         .drop(columns=["order_week"], errors="ignore")
-        .merge(lag1, on=["asin", "horizon"], how="left")
+        .merge(
+            lag1,
+            on=["asin", "horizon"],
+            how="left",
+            validate="one_to_one",
+        )
         .merge(
             actual,
             left_on=["asin", "target_week", "horizon"],
             right_on=["asin", "order_week", "horizon"],
             how="left",
+            validate="one_to_one",
         )
         .drop(columns=["order_week"], errors="ignore")
     )
 
-    detail.insert(0, "data_cut", data_cut)
-    detail.insert(1, "scot_oos_filter", 0)
+    detail.insert(0, "origin_cut", pd.Timestamp(origin_cut))
+    detail.insert(1, "current_order_week", current_week)
 
     return detail, {
-        "origin_asins": len(origin_asins),
-        "chris_jit_joint": len(joint),
-        "scot_oos0": len(selected),
-        "scot_col": scot_col,
-        "current_order_week": current_order_week,
+        **cohort_info,
         "target_week_by_h": target_week_by_h,
         "lag1_week_by_h": lag1_week_by_h,
-        "plan_rows_found": int(len(plan_rows)),
-        "actual_rows_found_by_h": {
-            h: int(len(actual_raw_by_h[h][
-                actual_raw_by_h[h]["order_week"].eq(target_week_by_h[h])
-                & actual_raw_by_h[h]["asin"].isin(selected)
-            ]))
-            for h in [1, 2, 3]
-        },
+        "actual_cut_by_h": actual_cut_by_h,
+        "plan_source": "current origin snapshot",
+        "actual_match_rows_by_h": actual_match_rows,
     }
 
 
-# -----------------------------
-# Metrics / printing
-# -----------------------------
-def numeric_metrics(g, field):
-    plan = pd.to_numeric(g[f"plan_{field}"], errors="coerce")
-    lag1 = pd.to_numeric(g[f"lag1_{field}"], errors="coerce")
-    actual = pd.to_numeric(g[f"actual_{field}"], errors="coerce")
+# ----------------------------------------------------------------
+# METRICS
+# ----------------------------------------------------------------
+def numeric_metrics(group, field):
+    plan = pd.to_numeric(group[f"plan_{field}"], errors="coerce")
+    lag1 = pd.to_numeric(group[f"lag1_{field}"], errors="coerce")
+    actual = pd.to_numeric(group[f"actual_{field}"], errors="coerce")
 
     plan_ok = plan.notna() & actual.notna()
-    lag_ok = lag1.notna() & actual.notna()
+    lag1_ok = lag1.notna() & actual.notna()
     both_ok = plan.notna() & lag1.notna() & actual.notna()
 
     plan_abs = (plan - actual).abs()
-    lag_abs = (lag1 - actual).abs()
+    lag1_abs = (lag1 - actual).abs()
 
     result = {
-        "rows": len(g),
+        "rows": len(group),
         "plan_missing": int(plan.isna().sum()),
         "actual_missing": int(actual.isna().sum()),
         "lag1_missing": int(lag1.isna().sum()),
         "plan_actual_compared": int(plan_ok.sum()),
-        "lag1_actual_compared": int(lag_ok.sum()),
+        "lag1_actual_compared": int(lag1_ok.sum()),
         "both_compared": int(both_ok.sum()),
-        "plan_mae": float(plan_abs[plan_ok].mean()) if plan_ok.any() else np.nan,
-        "lag1_mae": float(lag_abs[lag_ok].mean()) if lag_ok.any() else np.nan,
+        "plan_mae": plan_abs[plan_ok].mean() if plan_ok.any() else np.nan,
+        "lag1_mae": lag1_abs[lag1_ok].mean() if lag1_ok.any() else np.nan,
         "plan_median_abs_gap": (
-            float(plan_abs[plan_ok].median()) if plan_ok.any() else np.nan
+            plan_abs[plan_ok].median() if plan_ok.any() else np.nan
         ),
         "lag1_median_abs_gap": (
-            float(lag_abs[lag_ok].median()) if lag_ok.any() else np.nan
+            lag1_abs[lag1_ok].median() if lag1_ok.any() else np.nan
         ),
         "plan_p90_abs_gap": (
-            float(plan_abs[plan_ok].quantile(0.90)) if plan_ok.any() else np.nan
+            plan_abs[plan_ok].quantile(0.90) if plan_ok.any() else np.nan
         ),
         "lag1_p90_abs_gap": (
-            float(lag_abs[lag_ok].quantile(0.90)) if lag_ok.any() else np.nan
+            lag1_abs[lag1_ok].quantile(0.90) if lag1_ok.any() else np.nan
+        ),
+        "plan_exact_match_rate": (
+            np.isclose(plan[plan_ok], actual[plan_ok]).mean()
+            if plan_ok.any()
+            else np.nan
         ),
     }
 
     if both_ok.any():
         p = plan_abs[both_ok]
-        l = lag_abs[both_ok]
+        l = lag1_abs[both_ok]
+
         result.update(
             {
-                "plan_win_rate": float((p < l).mean()),
-                "lag1_win_rate": float((l < p).mean()),
-                "tie_rate": float(np.isclose(p, l).mean()),
-                "lag1_improvement": float((p - l).mean()),
+                "plan_win_rate": (p < l).mean(),
+                "lag1_win_rate": (l < p).mean(),
+                "tie_rate": np.isclose(p, l).mean(),
+                # Positive means PLAN has lower error than LAG1.
+                "mae_gain_vs_lag1": (l - p).mean(),
             }
         )
     else:
@@ -452,38 +516,38 @@ def numeric_metrics(g, field):
                 "plan_win_rate": np.nan,
                 "lag1_win_rate": np.nan,
                 "tie_rate": np.nan,
-                "lag1_improvement": np.nan,
+                "mae_gain_vs_lag1": np.nan,
             }
         )
 
     return result
 
 
-def categorical_metrics(g, field):
-    plan = normalize_string(g[f"plan_{field}"])
-    lag1 = normalize_string(g[f"lag1_{field}"])
-    actual = normalize_string(g[f"actual_{field}"])
+def categorical_metrics(group, field):
+    plan = normalize_string(group[f"plan_{field}"])
+    lag1 = normalize_string(group[f"lag1_{field}"])
+    actual = normalize_string(group[f"actual_{field}"])
 
     plan_ok = plan.notna() & actual.notna()
-    lag_ok = lag1.notna() & actual.notna()
+    lag1_ok = lag1.notna() & actual.notna()
     both_ok = plan.notna() & lag1.notna() & actual.notna()
 
     result = {
-        "rows": len(g),
+        "rows": len(group),
         "plan_missing": int(plan.isna().sum()),
         "actual_missing": int(actual.isna().sum()),
         "lag1_missing": int(lag1.isna().sum()),
         "plan_actual_compared": int(plan_ok.sum()),
-        "lag1_actual_compared": int(lag_ok.sum()),
+        "lag1_actual_compared": int(lag1_ok.sum()),
         "both_compared": int(both_ok.sum()),
         "plan_match_rate": (
-            float(plan[plan_ok].eq(actual[plan_ok]).mean())
+            plan[plan_ok].eq(actual[plan_ok]).mean()
             if plan_ok.any()
             else np.nan
         ),
         "lag1_match_rate": (
-            float(lag1[lag_ok].eq(actual[lag_ok]).mean())
-            if lag_ok.any()
+            lag1[lag1_ok].eq(actual[lag1_ok]).mean()
+            if lag1_ok.any()
             else np.nan
         ),
     }
@@ -494,9 +558,9 @@ def categorical_metrics(g, field):
 
         result.update(
             {
-                "plan_win_rate": float((p_match & ~l_match).mean()),
-                "lag1_win_rate": float((l_match & ~p_match).mean()),
-                "tie_rate": float((p_match == l_match).mean()),
+                "plan_win_rate": (p_match & ~l_match).mean(),
+                "lag1_win_rate": (l_match & ~p_match).mean(),
+                "tie_rate": (p_match == l_match).mean(),
             }
         )
     else:
@@ -511,156 +575,229 @@ def categorical_metrics(g, field):
     return result
 
 
-def fmt(x):
-    if pd.isna(x):
+def fmt_number(value):
+    if pd.isna(value):
         return "NA"
-    if isinstance(x, (int, np.integer)):
-        return f"{x:,}"
-    return f"{float(x):.4f}"
+    if isinstance(value, (int, np.integer)):
+        return f"{value:,}"
+    return f"{float(value):.6f}"
 
 
-def print_field_summary(g, field):
-    print(f"\n  [{field}]")
-
-    if field == "pricing_type":
-        m = categorical_metrics(g, field)
-        print(
-            "    Missing counts: "
-            f"PLAN={m['plan_missing']:,}, "
-            f"ACTUAL={m['actual_missing']:,}, "
-            f"LAG1={m['lag1_missing']:,}"
-        )
-        print(
-            "    Comparable counts: "
-            f"PLAN-vs-ACTUAL={m['plan_actual_compared']:,}, "
-            f"LAG1-vs-ACTUAL={m['lag1_actual_compared']:,}, "
-            f"all-three={m['both_compared']:,}"
-        )
-        print(
-            "    Match rate: "
-            f"PLAN={fmt(m['plan_match_rate'])}, "
-            f"LAG1={fmt(m['lag1_match_rate'])}"
-        )
-        print(
-            "    Winner rate on all-three rows: "
-            f"PLAN={fmt(m['plan_win_rate'])}, "
-            f"LAG1={fmt(m['lag1_win_rate'])}, "
-            f"TIE={fmt(m['tie_rate'])}"
-        )
-    else:
-        m = numeric_metrics(g, field)
-        print(
-            "    Missing counts: "
-            f"PLAN={m['plan_missing']:,}, "
-            f"ACTUAL={m['actual_missing']:,}, "
-            f"LAG1={m['lag1_missing']:,}"
-        )
-        print(
-            "    Comparable counts: "
-            f"PLAN-vs-ACTUAL={m['plan_actual_compared']:,}, "
-            f"LAG1-vs-ACTUAL={m['lag1_actual_compared']:,}, "
-            f"all-three={m['both_compared']:,}"
-        )
-        print(
-            "    MAE: "
-            f"PLAN={fmt(m['plan_mae'])}, "
-            f"LAG1={fmt(m['lag1_mae'])}"
-        )
-        print(
-            "    Median abs gap: "
-            f"PLAN={fmt(m['plan_median_abs_gap'])}, "
-            f"LAG1={fmt(m['lag1_median_abs_gap'])}"
-        )
-        print(
-            "    P90 abs gap: "
-            f"PLAN={fmt(m['plan_p90_abs_gap'])}, "
-            f"LAG1={fmt(m['lag1_p90_abs_gap'])}"
-        )
-        print(
-            "    Winner rate on all-three rows: "
-            f"PLAN={fmt(m['plan_win_rate'])}, "
-            f"LAG1={fmt(m['lag1_win_rate'])}, "
-            f"TIE={fmt(m['tie_rate'])}"
-        )
-        print(
-            "    PLAN_MAE - LAG1_MAE equivalent improvement: "
-            f"{fmt(m['lag1_improvement'])} "
-            "(positive means LAG1 is better)"
-        )
+def fmt_pct(value):
+    if pd.isna(value):
+        return "NA"
+    return f"{100 * float(value):.2f}%"
 
 
-def print_top_asin_gaps(g, field, n=10):
-    if field == "pricing_type":
-        plan = normalize_string(g[f"plan_{field}"])
-        lag1 = normalize_string(g[f"lag1_{field}"])
-        actual = normalize_string(g[f"actual_{field}"])
+# ----------------------------------------------------------------
+# PRINTING
+# ----------------------------------------------------------------
+def print_numeric_summary(group, field):
+    metrics = numeric_metrics(group, field)
 
-        tmp = g[
-            ["asin", "horizon", "target_week"]
-        ].copy()
-        tmp["plan"] = plan
-        tmp["lag1"] = lag1
-        tmp["actual"] = actual
-        tmp = tmp[
-            tmp["plan"].notna()
-            & tmp["lag1"].notna()
-            & tmp["actual"].notna()
-        ]
-        tmp["plan_match"] = tmp["plan"].eq(tmp["actual"])
-        tmp["lag1_match"] = tmp["lag1"].eq(tmp["actual"])
+    print(
+        f"rows={metrics['rows']:,} | "
+        f"PLAN missing={metrics['plan_missing']:,} | "
+        f"ACTUAL missing={metrics['actual_missing']:,} | "
+        f"LAG1 missing={metrics['lag1_missing']:,}"
+    )
+    print(
+        f"PLAN↔ACTUAL compared={metrics['plan_actual_compared']:,} | "
+        f"LAG1↔ACTUAL compared={metrics['lag1_actual_compared']:,} | "
+        f"PLAN/LAG1/ACTUAL all present={metrics['both_compared']:,}"
+    )
+    print(
+        "PLAN: "
+        f"MAE={fmt_number(metrics['plan_mae'])} | "
+        f"median abs gap={fmt_number(metrics['plan_median_abs_gap'])} | "
+        f"P90 abs gap={fmt_number(metrics['plan_p90_abs_gap'])} | "
+        f"exact match={fmt_pct(metrics['plan_exact_match_rate'])}"
+    )
+    print(
+        "LAG1: "
+        f"MAE={fmt_number(metrics['lag1_mae'])} | "
+        f"median abs gap={fmt_number(metrics['lag1_median_abs_gap'])} | "
+        f"P90 abs gap={fmt_number(metrics['lag1_p90_abs_gap'])}"
+    )
+    print(
+        "PLAN vs LAG1: "
+        f"PLAN wins={fmt_pct(metrics['plan_win_rate'])} | "
+        f"ties={fmt_pct(metrics['tie_rate'])} | "
+        f"LAG1 wins={fmt_pct(metrics['lag1_win_rate'])} | "
+        f"mean absolute-error gain={fmt_number(metrics['mae_gain_vs_lag1'])}"
+    )
 
-        interesting = tmp[
-            tmp["plan_match"].ne(tmp["lag1_match"])
-        ].head(n)
 
-        if len(interesting):
-            print(f"    Example ASINs where PLAN and LAG1 differ (first {n}):")
-            print(interesting.to_string(index=False))
-        return
+def print_categorical_summary(group, field):
+    metrics = categorical_metrics(group, field)
 
-    plan = pd.to_numeric(g[f"plan_{field}"], errors="coerce")
-    lag1 = pd.to_numeric(g[f"lag1_{field}"], errors="coerce")
-    actual = pd.to_numeric(g[f"actual_{field}"], errors="coerce")
+    print(
+        f"rows={metrics['rows']:,} | "
+        f"PLAN missing={metrics['plan_missing']:,} | "
+        f"ACTUAL missing={metrics['actual_missing']:,} | "
+        f"LAG1 missing={metrics['lag1_missing']:,}"
+    )
+    print(
+        f"PLAN↔ACTUAL compared={metrics['plan_actual_compared']:,} | "
+        f"LAG1↔ACTUAL compared={metrics['lag1_actual_compared']:,} | "
+        f"PLAN/LAG1/ACTUAL all present={metrics['both_compared']:,}"
+    )
+    print(
+        f"PLAN exact match={fmt_pct(metrics['plan_match_rate'])} | "
+        f"LAG1 exact match={fmt_pct(metrics['lag1_match_rate'])}"
+    )
+    print(
+        "PLAN vs LAG1: "
+        f"PLAN wins={fmt_pct(metrics['plan_win_rate'])} | "
+        f"ties={fmt_pct(metrics['tie_rate'])} | "
+        f"LAG1 wins={fmt_pct(metrics['lag1_win_rate'])}"
+    )
 
-    tmp = g[["asin", "horizon", "target_week"]].copy()
-    tmp["plan"] = plan
-    tmp["lag1"] = lag1
-    tmp["actual"] = actual
-    tmp["plan_abs_gap"] = (plan - actual).abs()
-    tmp["lag1_abs_gap"] = (lag1 - actual).abs()
-    tmp["lag1_improvement"] = tmp["plan_abs_gap"] - tmp["lag1_abs_gap"]
 
-    tmp = tmp[
-        tmp["plan_abs_gap"].notna()
-        & tmp["lag1_abs_gap"].notna()
+def print_examples(group, field, top_n):
+    columns = [
+        "origin_cut",
+        "asin",
+        "horizon",
+        "target_week",
+        f"plan_{field}",
+        f"actual_{field}",
+        f"lag1_{field}",
+        "lag1_source_week",
+        "actual_cut",
     ]
 
-    if tmp.empty:
-        return
+    work = group[columns].copy()
 
-    print(f"    Largest PLAN gaps (top {n} ASIN rows):")
+    if field in CATEGORICAL_FIELDS:
+        plan = normalize_string(work[f"plan_{field}"])
+        actual = normalize_string(work[f"actual_{field}"])
+
+        valid = plan.notna() & actual.notna()
+        work = work.loc[valid].copy()
+        work["plan_matches_actual"] = plan[valid].eq(actual[valid])
+
+        # Mismatches first.
+        work = work.sort_values(
+            ["plan_matches_actual", "origin_cut", "horizon", "asin"],
+            ascending=[True, False, True, True],
+        ).head(top_n)
+    else:
+        plan = pd.to_numeric(work[f"plan_{field}"], errors="coerce")
+        actual = pd.to_numeric(work[f"actual_{field}"], errors="coerce")
+        lag1 = pd.to_numeric(work[f"lag1_{field}"], errors="coerce")
+
+        valid = plan.notna() & actual.notna()
+        work = work.loc[valid].copy()
+
+        work["plan_abs_gap"] = (plan[valid] - actual[valid]).abs()
+        work["lag1_abs_gap"] = (lag1[valid] - actual[valid]).abs()
+
+        work = work.sort_values(
+            "plan_abs_gap", ascending=False
+        ).head(top_n)
+
+    if work.empty:
+        print("No comparable examples.")
+    else:
+        print(work.to_string(index=False))
+
+
+def print_cut_report(detail, info):
+    origin_cut = pd.Timestamp(detail["origin_cut"].iloc[0])
+
+    print("\n" + "#" * 118)
+    print(f"ORIGIN CUT: {origin_cut.date()}")
+    print("#" * 118)
+    print(f"Current order_week: {info['target_week_by_h'][1] - pd.Timedelta(days=7)}")
     print(
-        tmp.sort_values("plan_abs_gap", ascending=False)
-        .head(n)
-        .to_string(index=False)
+        "Target weeks: "
+        + " | ".join(
+            f"H{h}={info['target_week_by_h'][h].date()}"
+            for h in [1, 2, 3]
+        )
+    )
+    print(
+        "Actual cuts: "
+        + " | ".join(
+            f"H{h}={pd.Timestamp(info['actual_cut_by_h'][h]).date()}"
+            for h in [1, 2, 3]
+        )
+    )
+    print(
+        f"Cohort: origin ASINs={info['origin_asins']:,} | "
+        f"Chris∩JIT={info['chris_jit_joint']:,} | "
+        f"scot_oos=0 selected={info['scot_oos0_selected']:,}"
+    )
+    print(
+        "Matched actual source rows: "
+        + " | ".join(
+            f"H{h}={info['actual_match_rows_by_h'][h]:,}"
+            for h in [1, 2, 3]
+        )
     )
 
-    print(f"    Rows where LAG1 improves most over PLAN (top {n}):")
-    print(
-        tmp.sort_values("lag1_improvement", ascending=False)
-        .head(n)
-        .to_string(index=False)
-    )
+    for field in PLAN_FIELDS:
+        print("\n" + "=" * 118)
+        print(f"FIELD: {field}")
+        print("=" * 118)
+
+        for h in [1, 2, 3]:
+            print(f"\nH{h}")
+            group = detail[detail["horizon"].eq(h)].copy()
+
+            if field in CATEGORICAL_FIELDS:
+                print_categorical_summary(group, field)
+            else:
+                print_numeric_summary(group, field)
+
+        print("\nALL H1-H3 COMBINED")
+        if field in CATEGORICAL_FIELDS:
+            print_categorical_summary(detail, field)
+        else:
+            print_numeric_summary(detail, field)
+
+        print(f"\nTop {TOP_ASINS_TO_PRINT} examples:")
+        print_examples(detail, field, TOP_ASINS_TO_PRINT)
 
 
-# -----------------------------
-# Run
-# -----------------------------
-def run_analysis():
-    s3 = boto3.client("s3")
+def print_combined_report(combined):
+    print("\n" + "#" * 118)
+    print("COMBINED ACROSS ALL VALID ORIGIN CUTS")
+    print("#" * 118)
 
-    cuts = list_snapshot_cuts(BUCKET, DATA_PREFIX, s3)
-    pairs = build_last3_origin_pairs(cuts)
+    for field in PLAN_FIELDS:
+        print("\n" + "=" * 118)
+        print(f"FIELD: {field}")
+        print("=" * 118)
+
+        for h in [1, 2, 3]:
+            print(f"\nH{h}")
+            group = combined[combined["horizon"].eq(h)].copy()
+
+            if field in CATEGORICAL_FIELDS:
+                print_categorical_summary(group, field)
+            else:
+                print_numeric_summary(group, field)
+
+        print("\nALL H1-H3 COMBINED")
+        if field in CATEGORICAL_FIELDS:
+            print_categorical_summary(combined, field)
+        else:
+            print_numeric_summary(combined, field)
+
+        print(f"\nTop {TOP_ASINS_TO_PRINT} examples across cuts:")
+        print_examples(combined, field, TOP_ASINS_TO_PRINT)
+
+
+# ----------------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------------
+def main():
+    print("=" * 118)
+    print("CURRENT-CUT H1/H2/H3 PLAN VS FUTURE REALIZED VALUE CHECK")
+    print("=" * 118)
+    print("Nothing will be written to disk.")
 
     chris_set = load_asin_set(CHRIS_CSV)
     jit_set = load_asin_set(
@@ -668,54 +805,63 @@ def run_analysis():
         excluded=JIT_EXCLUDED_ASINS,
     )
 
-    print("=" * 110)
-    print("JOINT Chris ∩ JIT ∩ scot_oos=0 | FUTURE PLAN vs LAG1 vs LATER-CUT ACTUAL")
-    print("=" * 110)
     print(
         f"Chris={len(chris_set):,} | "
-        f"JIT(after exclusions)={len(jit_set):,} | "
+        f"JIT after exclusions={len(jit_set):,} | "
         f"Chris∩JIT={len(chris_set & jit_set):,}"
     )
-    print("Use the latest 3 VALID origin cuts. Cuts without complete H1/H2/H3 plan weeks are skipped. Nothing will be saved.")
 
-    read_columns = [
+    s3 = boto3.client("s3")
+    cuts = list_snapshot_cuts(BUCKET, DATA_PREFIX, s3)
+    candidates = build_origin_candidates(cuts)
+
+    wanted_columns = [
         "asin",
         "order_week",
-        *FIELDS,
+        *PLAN_FIELDS,
         *SCOT_OOS_CANDIDATES,
     ]
 
-    all_detail = []
-    valid_cut_results = []
+    valid_details = []
 
-    # Scan from newest to oldest. A cut is accepted only when its origin
-    # snapshot contains current week + complete H1/H2/H3 future plan weeks.
-    for _, row in pairs.sort_values("data_cut", ascending=False).iterrows():
-        if len(valid_cut_results) >= MAX_CUTS:
+    # Scan newest to oldest and retain the latest N valid origin cuts.
+    for _, row in candidates.iterrows():
+        if len(valid_details) >= MAX_VALID_ORIGIN_CUTS:
             break
 
-        data_cut = pd.Timestamp(row["data_cut"])
-        actual_cut_by_h = {
-            1: pd.Timestamp(row["h1_cut"]),
-            2: pd.Timestamp(row["h2_cut"]),
-            3: pd.Timestamp(row["h3_cut"]),
-        }
+        origin_cut = pd.Timestamp(row["origin_cut"])
+
+        print(f"\n[READ] origin cut {origin_cut.date()}")
 
         origin_raw = read_s3_csv_columns(
-            BUCKET, row["origin_key"], read_columns, s3
+            BUCKET,
+            row["origin_key"],
+            wanted_columns,
+            s3,
         )
 
         actual_raw_by_h = {
-            h: read_s3_csv_columns(
-                BUCKET, row[f"h{h}_key"], read_columns, s3
-            )
-            for h in [1, 2, 3]
+            1: read_s3_csv_columns(
+                BUCKET, row["h1_actual_key"], wanted_columns, s3
+            ),
+            2: read_s3_csv_columns(
+                BUCKET, row["h2_actual_key"], wanted_columns, s3
+            ),
+            3: read_s3_csv_columns(
+                BUCKET, row["h3_actual_key"], wanted_columns, s3
+            ),
         }
 
-        detail, cohort_info = make_detail_for_cut(
+        actual_cut_by_h = {
+            1: pd.Timestamp(row["h1_actual_cut"]),
+            2: pd.Timestamp(row["h2_actual_cut"]),
+            3: pd.Timestamp(row["h3_actual_cut"]),
+        }
+
+        detail, info = build_detail_for_origin(
             origin_raw=origin_raw,
             actual_raw_by_h=actual_raw_by_h,
-            data_cut=data_cut,
+            origin_cut=origin_cut,
             actual_cut_by_h=actual_cut_by_h,
             chris_set=chris_set,
             jit_set=jit_set,
@@ -723,121 +869,34 @@ def run_analysis():
 
         if detail is None:
             print(
-                f"[SKIP] origin cut {data_cut.date()} skipped: "
-                f"{cohort_info.get('skip_reason', 'insufficient H1/H2/H3 weeks')}"
+                f"[SKIP] origin cut {origin_cut.date()}: "
+                f"{info.get('skip_reason', 'invalid cut')}"
             )
             continue
 
-        valid_cut_results.append((data_cut, detail, cohort_info, actual_cut_by_h))
-        all_detail.append(detail)
+        valid_details.append(detail)
+        print_cut_report(detail, info)
 
-        cut_i = len(valid_cut_results)
-
-        print("\n" + "#" * 110)
-        target_map = (
-            detail[["horizon", "target_week"]]
-            .drop_duplicates()
-            .set_index("horizon")["target_week"]
-            .to_dict()
-        )
-
-        print(
-            f"CUT {cut_i + 1}: snapshot={data_cut.date()} | "
-            f"current_order_week={pd.Timestamp(cohort_info['current_order_week']).date()}"
-        )
-        print(
-            f"  H1 PLAN week={pd.Timestamp(target_map[1]).date()} | "
-            f"LAG1 week={pd.Timestamp(cohort_info['lag1_week_by_h'][1]).date()} | "
-            f"ACTUAL snapshot={actual_cut_by_h[1].date()}"
-        )
-        print(
-            f"  H2 PLAN week={pd.Timestamp(target_map[2]).date()} | "
-            f"LAG1 week={pd.Timestamp(cohort_info['lag1_week_by_h'][2]).date()} | "
-            f"ACTUAL snapshot={actual_cut_by_h[2].date()}"
-        )
-        print(
-            f"  H3 PLAN week={pd.Timestamp(target_map[3]).date()} | "
-            f"LAG1 week={pd.Timestamp(cohort_info['lag1_week_by_h'][3]).date()} | "
-            f"ACTUAL snapshot={actual_cut_by_h[3].date()}"
-        )
-        print(
-            f"Cohort: origin ASIN={cohort_info['origin_asins']:,} | "
-            f"Chris∩JIT={cohort_info['chris_jit_joint']:,} | "
-            f"{cohort_info['scot_col']}=0 => {cohort_info['scot_oos0']:,} ASIN"
-        )
-        print(
-            f"Matched source rows: origin PLAN rows={cohort_info['plan_rows_found']:,} | "
-            f"H1 ACTUAL rows={cohort_info['actual_rows_found_by_h'][1]:,} | "
-            f"H2 ACTUAL rows={cohort_info['actual_rows_found_by_h'][2]:,} | "
-            f"H3 ACTUAL rows={cohort_info['actual_rows_found_by_h'][3]:,}"
-        )
-
-        for h in [1, 2, 3]:
-            g = detail[detail["horizon"].eq(h)]
-            print("\n" + "-" * 110)
-            target_week = pd.Timestamp(
-                g["target_week"].dropna().iloc[0]
-            ).date() if g["target_week"].notna().any() else "NA"
-            print(
-                f"H{h} | target_week={target_week} | "
-                f"actual_snapshot={actual_cut_by_h[h].date()} | "
-                f"ASIN rows={len(g):,}"
-            )
-
-            for field in FIELDS:
-                print_field_summary(g, field)
-
-            # Print ASIN-level examples, but keep output readable.
-            print("\n  ASIN-level largest differences:")
-            for field in FIELDS:
-                print(f"\n  >>> {field}")
-                print_top_asin_gaps(
-                    g,
-                    field,
-                    n=TOP_ASINS_TO_PRINT,
-                )
-
-    if not all_detail:
+    if not valid_details:
         raise RuntimeError(
-            "No valid origin cut contains a complete current week plus H1/H2/H3 "
-            "future order_week plan sequence."
+            "No valid origin cuts were found. Check snapshot schema and cohort files."
         )
 
-    if len(all_detail) < MAX_CUTS:
+    if len(valid_details) < MAX_VALID_ORIGIN_CUTS:
         print(
-            f"\n[WARNING] Only {len(all_detail)} valid cuts were found; "
-            f"requested {MAX_CUTS}."
+            f"\n[WARNING] Requested {MAX_VALID_ORIGIN_CUTS} valid cuts, "
+            f"but found only {len(valid_details)}."
         )
 
-    combined = pd.concat(all_detail, ignore_index=True)
+    combined = pd.concat(valid_details, ignore_index=True)
+    print_combined_report(combined)
 
-    print("\n" + "=" * 110)
-    print("COMBINED RESULTS ACROSS THE LATEST 3 CUTS")
-    print("=" * 110)
-
-    for h in [1, 2, 3]:
-        g = combined[combined["horizon"].eq(h)]
-        print("\n" + "-" * 110)
-        print(f"Combined H{h} | rows={len(g):,} | ASIN={g['asin'].nunique():,}")
-        for field in FIELDS:
-            print_field_summary(g, field)
-
-    print("\n" + "-" * 110)
-    print(
-        f"Combined ALL horizons | rows={len(combined):,} | "
-        f"ASIN={combined['asin'].nunique():,}"
-    )
-    for field in FIELDS:
-        print_field_summary(combined, field)
-
-    print("\nInterpretation:")
-    print("1) Numeric fields: lower MAE / median / P90 gap is better.")
-    print("2) pricing_type: higher match rate is better.")
-    print("3) PLAN win rate > LAG1 win rate means origin plan is more useful.")
-    print("4) LAG1 win rate > PLAN win rate indicates plan lag/staleness.")
-    print("5) Missing counts show how often PLAN or ACTUAL itself is unavailable.")
+    print("\n" + "=" * 118)
+    print("DONE — printed only; no output files were saved.")
+    print("=" * 118)
 
     return combined
 
 
-detail_df = run_analysis()
+# Run immediately when pasted into one notebook cell or executed as a script.
+detail = main()
