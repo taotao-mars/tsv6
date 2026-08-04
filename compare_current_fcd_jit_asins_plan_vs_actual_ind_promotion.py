@@ -1,23 +1,3 @@
-"""Compare origin-time planned vs eval-time actual ind_promotion for one FCD.
-
-This script is intentionally independent of model training.  It uses only the
-ASINs in the supplied JIT cohort CSV and fixes the rolling dates to the current
-experiment by default:
-
-    data cut / plan snapshot: 2025-10-04
-    FCD / H1:                 2025-10-05
-    H2:                       2025-10-12
-    H3:                       2025-10-19
-    evaluation snapshot:      2025-10-25
-
-For each ASIN and target week, planned_ind_promotion is 1 when at least one
-origin-time deal interval covers that week; otherwise it is 0.  The choice
-between multiple overlapping deals is irrelevant for this binary feature.
-"""
-
-from __future__ import annotations
-
-import argparse
 import io
 import re
 from pathlib import Path
@@ -27,510 +7,817 @@ import numpy as np
 import pandas as pd
 
 
+# ============================================================
+# 1. 当前 FCD 设置
+# ============================================================
+
 S3_BUCKET = "amxl-asin-forecast590184089576"
-MODEL_DATA_PREFIX = (
-    "amxl-asin-forecast-intern/data_for_model/"
-    "df_head_body_add_holiday_"
+
+DATA_CUT = pd.Timestamp("2025-10-04")
+FCD = pd.Timestamp("2025-10-05")
+
+TARGET_WEEKS = [
+    FCD,                              # H1
+    FCD + pd.Timedelta(days=7),       # H2
+    FCD + pd.Timedelta(days=14),      # H3
+]
+
+HORIZON_MAP = {
+    TARGET_WEEKS[0]: "H1",
+    TARGET_WEEKS[1]: "H2",
+    TARGET_WEEKS[2]: "H3",
+}
+
+DEALS_KEY = (
+    "amxl-asin-forecast-intern/asin_deals/"
+    "asin_deals_20251004.csv000"
 )
-DEALS_PREFIX = "amxl-asin-forecast-intern/asin_deals/"
 
-DEFAULT_DATA_CUT = "2025-10-04"
-DEFAULT_ASIN_FILE_GLOB = "jit_asins_top90pct_demand*.csv"
+EVAL_PREFIX = (
+    "amxl-asin-forecast-intern/data_for_model/"
+    "df_head_body_add_holiday_2025-10-25"
+)
 
-
-def _normalize_asin(series: pd.Series) -> pd.Series:
-    return series.astype(str).str.strip()
-
-
-def _find_asin_column(df: pd.DataFrame) -> str:
-    by_lower = {str(c).strip().lower(): c for c in df.columns}
-    if "asin" not in by_lower:
-        raise KeyError(
-            "The cohort CSV must contain an ASIN column. "
-            f"Available columns: {list(df.columns)}"
-        )
-    return by_lower["asin"]
+OUTPUT_DIR = Path("jit_current_fcd_promo_comparison")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _resolve_asin_csv(path: str | Path | None) -> Path:
-    if path is not None:
-        resolved = Path(path).expanduser().resolve()
-        if not resolved.exists():
-            raise FileNotFoundError(f"ASIN cohort CSV not found: {resolved}")
-        return resolved
+# ============================================================
+# 2. 自动找到本地 JIT ASIN CSV
+# ============================================================
 
-    matches = sorted(Path.cwd().glob(DEFAULT_ASIN_FILE_GLOB))
-    if len(matches) == 1:
-        return matches[0].resolve()
-    if not matches:
-        raise FileNotFoundError(
-            "No JIT ASIN cohort CSV was found in the current directory. "
-            "Pass asin_csv_path explicitly."
-        )
-    raise RuntimeError(
-        "Multiple candidate JIT ASIN CSV files were found; pass "
-        "asin_csv_path explicitly:\n  "
-        + "\n  ".join(str(p.resolve()) for p in matches)
+def find_jit_asin_csv():
+    patterns = [
+        "jit_asins_top90pct_demand*.csv",
+        "**/jit_asins_top90pct_demand*.csv",
+    ]
+
+    candidates = []
+
+    search_roots = [
+        Path.cwd(),
+        Path("/home/sagemaker-user"),
+    ]
+
+    for root in search_roots:
+        if not root.exists():
+            continue
+
+        for pattern in patterns:
+            try:
+                candidates.extend(root.glob(pattern))
+            except Exception:
+                pass
+
+    candidates = sorted(
+        {
+            path.resolve()
+            for path in candidates
+            if path.is_file()
+        }
     )
 
+    if not candidates:
+        raise FileNotFoundError(
+            "找不到 jit_asins_top90pct_demand*.csv。"
+            "请把 CSV 上传到当前 notebook 目录。"
+        )
 
-def _list_s3_keys(bucket: str, prefix: str, s3_client) -> list[str]:
-    keys: list[str] = []
-    paginator = s3_client.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj.get("Key")
-            if key:
-                keys.append(key)
-    return keys
+    # 如果存在多个同名版本，使用最后修改的一个
+    selected = max(
+        candidates,
+        key=lambda path: path.stat().st_mtime,
+    )
+
+    print("JIT ASIN CSV:", selected)
+
+    if len(candidates) > 1:
+        print("发现多个候选文件，使用最后修改的文件。")
+        for path in candidates:
+            print("  ", path)
+
+    return selected
 
 
-def _read_s3_csv(bucket: str, key: str, s3_client) -> pd.DataFrame:
-    print(f"Reading s3://{bucket}/{key}", flush=True)
-    body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
+ASIN_CSV_PATH = find_jit_asin_csv()
+
+
+# ============================================================
+# 3. S3 读取函数
+# ============================================================
+
+s3_client = boto3.client("s3")
+
+
+def read_s3_csv(bucket, key):
+    print(f"\nReading s3://{bucket}/{key}")
+
+    body = s3_client.get_object(
+        Bucket=bucket,
+        Key=key,
+    )["Body"].read()
+
     df = pd.read_csv(io.BytesIO(body))
-    print(f"  rows={len(df):,}, columns={len(df.columns):,}", flush=True)
+
+    print(
+        f"Loaded rows={len(df):,}, "
+        f"columns={len(df.columns):,}"
+    )
+
     return df
 
 
-def _find_eval_snapshot_key(
-    data_cut: pd.Timestamp,
-    bucket: str,
-    data_prefix: str,
-    s3_client,
-) -> tuple[pd.Timestamp, str]:
-    eval_cut = data_cut + pd.Timedelta(days=21)
-    token = eval_cut.strftime("%Y-%m-%d")
-    prefix = f"{data_prefix}{token}"
-    pattern = re.compile(
-        rf"df_head_body_add_holiday_{re.escape(token)}_?ETLM_[vV]3\.csv$"
+def list_s3_keys(bucket, prefix):
+    keys = []
+
+    paginator = s3_client.get_paginator("list_objects_v2")
+
+    for page in paginator.paginate(
+        Bucket=bucket,
+        Prefix=prefix,
+    ):
+        for obj in page.get("Contents", []):
+            if obj.get("Key"):
+                keys.append(obj["Key"])
+
+    return keys
+
+
+def find_eval_key():
+    keys = list_s3_keys(
+        S3_BUCKET,
+        EVAL_PREFIX,
     )
+
+    pattern = re.compile(
+        r"df_head_body_add_holiday_"
+        r"2025-10-25_?ETLM_[vV]3\.csv$"
+    )
+
     matches = [
-        key for key in _list_s3_keys(bucket, prefix, s3_client)
+        key
+        for key in keys
         if pattern.search(key)
     ]
+
     if len(matches) != 1:
         raise RuntimeError(
-            f"Expected exactly one eval snapshot for {eval_cut.date()}, "
-            f"found {len(matches)}: {matches}"
+            "无法唯一确定 2025-10-25 eval 文件："
+            f"{matches}"
         )
-    return eval_cut, matches[0]
+
+    return matches[0]
 
 
-def _find_deals_snapshot_key(
-    data_cut: pd.Timestamp,
-    bucket: str,
-    deals_prefix: str,
-    s3_client,
-) -> str:
-    token = data_cut.strftime("%Y%m%d")
-    expected = f"{deals_prefix.rstrip('/')}/asin_deals_{token}.csv000"
-    # Use the exact origin-time filename when it exists.  Listing also gives a
-    # readable error if the S3 export used a slightly different suffix.
-    keys = _list_s3_keys(
-        bucket,
-        f"{deals_prefix.rstrip('/')}/asin_deals_{token}",
-        s3_client,
-    )
-    if expected in keys:
-        return expected
-    if len(keys) == 1:
-        print(
-            f"Expected {expected}, using the only matching key instead: {keys[0]}",
-            flush=True,
-        )
-        return keys[0]
-    raise RuntimeError(
-        f"Could not uniquely resolve the deals snapshot for {data_cut.date()}. "
-        f"Expected {expected}; matching keys={keys}"
+EVAL_KEY = find_eval_key()
+
+print("\nDeals file:", DEALS_KEY)
+print("Eval file:", EVAL_KEY)
+
+
+# ============================================================
+# 4. 读取 JIT cohort、planned deals、eval actual
+# ============================================================
+
+asin_df = pd.read_csv(ASIN_CSV_PATH)
+
+asin_column_map = {
+    str(column).strip().lower(): column
+    for column in asin_df.columns
+}
+
+if "asin" not in asin_column_map:
+    raise KeyError(
+        f"ASIN CSV 中找不到 asin 列。现有列：{list(asin_df.columns)}"
     )
 
+asin_col = asin_column_map["asin"]
 
-def _build_target_grid(
-    asins: list[str],
-    fcd: pd.Timestamp,
-) -> pd.DataFrame:
-    target_weeks = [
-        fcd,
-        fcd + pd.Timedelta(days=7),
-        fcd + pd.Timedelta(days=14),
-    ]
-    grid = pd.MultiIndex.from_product(
-        [asins, target_weeks],
-        names=["asin", "order_week"],
-    ).to_frame(index=False)
-    horizon_map = {week: f"H{i + 1}" for i, week in enumerate(target_weeks)}
-    grid["forecast_horizon"] = grid["order_week"].map(horizon_map)
-    return grid
+jit_asins = sorted(
+    set(
+        asin_df[asin_col]
+        .dropna()
+        .astype(str)
+        .str.strip()
+    )
+    - {"", "nan"}
+)
+
+print("\nUnique JIT ASINs:", len(jit_asins))
+
+deals_raw = read_s3_csv(
+    S3_BUCKET,
+    DEALS_KEY,
+)
+
+eval_raw = read_s3_csv(
+    S3_BUCKET,
+    EVAL_KEY,
+)
 
 
-def _build_planned_ind_promotion(
-    target_grid: pd.DataFrame,
-    deals_raw: pd.DataFrame,
-) -> pd.DataFrame:
-    required = {
-        "asin",
-        "asin_promo_start_week",
-        "asin_promo_end_week",
-    }
-    missing = sorted(required - set(deals_raw.columns))
-    if missing:
-        raise KeyError(
-            "Deals snapshot is missing required columns: " + ", ".join(missing)
-        )
+# ============================================================
+# 5. 构造每个 ASIN 的 H1/H2/H3
+# ============================================================
 
-    deals = deals_raw.copy()
-    deals["asin"] = _normalize_asin(deals["asin"])
-    deals["asin_promo_start_week"] = pd.to_datetime(
-        deals["asin_promo_start_week"], errors="coerce"
-    ).dt.normalize()
-    deals["asin_promo_end_week"] = pd.to_datetime(
-        deals["asin_promo_end_week"], errors="coerce"
-    ).dt.normalize()
-
-    selected_asins = set(target_grid["asin"])
-    min_week = target_grid["order_week"].min()
-    max_week = target_grid["order_week"].max()
-    deals = deals[
-        deals["asin"].isin(selected_asins)
-        & deals["asin_promo_start_week"].notna()
-        & deals["asin_promo_end_week"].notna()
-        & (deals["asin_promo_start_week"] <= max_week)
-        & (deals["asin_promo_end_week"] >= min_week)
-    ].copy()
-
-    candidates = target_grid.merge(
-        deals[
-            ["asin", "asin_promo_start_week", "asin_promo_end_week"]
+target_grid = (
+    pd.MultiIndex.from_product(
+        [
+            jit_asins,
+            TARGET_WEEKS,
         ],
-        on="asin",
-        how="left",
+        names=[
+            "asin",
+            "order_week",
+        ],
     )
-    covered = (
-        candidates["asin_promo_start_week"].notna()
-        & (candidates["order_week"] >= candidates["asin_promo_start_week"])
-        & (candidates["order_week"] <= candidates["asin_promo_end_week"])
-    )
-    matches = candidates.loc[covered].copy()
+    .to_frame(index=False)
+)
 
-    if matches.empty:
-        coverage = pd.DataFrame(
-            columns=[
-                "asin",
-                "order_week",
-                "matching_deal_count",
-                "matched_start_week_min",
-                "matched_start_week_max",
-                "matched_end_week_min",
-                "matched_end_week_max",
-            ]
-        )
+target_grid["forecast_horizon"] = (
+    target_grid["order_week"]
+    .map(HORIZON_MAP)
+)
+
+expected_rows = len(jit_asins) * 3
+
+assert len(target_grid) == expected_rows
+
+print("\nTarget weeks:")
+
+for week, horizon in HORIZON_MAP.items():
+    print(f"{horizon}: {week.date()}")
+
+print("Expected ASIN-week rows:", expected_rows)
+
+
+# ============================================================
+# 6. 从 origin-time deals 构造 planned_ind_promotion
+#
+# 逻辑与老板的 SQL 一致：
+# 只要至少一个 deal 覆盖该 asin + order_week，就等于 1。
+# ============================================================
+
+required_deal_cols = {
+    "asin",
+    "asin_promo_start_week",
+    "asin_promo_end_week",
+}
+
+missing_deal_cols = (
+    required_deal_cols
+    - set(deals_raw.columns)
+)
+
+if missing_deal_cols:
+    raise KeyError(
+        f"Deals table 缺少字段：{missing_deal_cols}"
+    )
+
+deals = deals_raw.copy()
+
+deals["asin"] = (
+    deals["asin"]
+    .astype(str)
+    .str.strip()
+)
+
+deals["asin_promo_start_week"] = pd.to_datetime(
+    deals["asin_promo_start_week"],
+    errors="coerce",
+).dt.normalize()
+
+deals["asin_promo_end_week"] = pd.to_datetime(
+    deals["asin_promo_end_week"],
+    errors="coerce",
+).dt.normalize()
+
+# 只保留当前 JIT ASIN
+deals = deals[
+    deals["asin"].isin(set(jit_asins))
+].copy()
+
+# 只保留可能与 H1-H3 重叠的 deal
+deals = deals[
+    deals["asin_promo_start_week"].notna()
+    & deals["asin_promo_end_week"].notna()
+    & (
+        deals["asin_promo_start_week"]
+        <= max(TARGET_WEEKS)
+    )
+    & (
+        deals["asin_promo_end_week"]
+        >= min(TARGET_WEEKS)
+    )
+].copy()
+
+# 按 ASIN join，然后检查目标周是否落在 deal 区间中
+plan_candidates = target_grid.merge(
+    deals[
+        [
+            "asin",
+            "asin_promo_start_week",
+            "asin_promo_end_week",
+        ]
+    ],
+    on="asin",
+    how="left",
+)
+
+covered_mask = (
+    plan_candidates[
+        "asin_promo_start_week"
+    ].notna()
+    & (
+        plan_candidates["order_week"]
+        >= plan_candidates[
+            "asin_promo_start_week"
+        ]
+    )
+    & (
+        plan_candidates["order_week"]
+        <= plan_candidates[
+            "asin_promo_end_week"
+        ]
+    )
+)
+
+covered_deals = plan_candidates[
+    covered_mask
+].copy()
+
+# 一个 ASIN-week 可以匹配多个 deal，
+# 但是 ind_promotion 仍然只等于 1
+planned_coverage = (
+    covered_deals
+    .groupby(
+        [
+            "asin",
+            "order_week",
+        ],
+        as_index=False,
+    )
+    .agg(
+        matching_deal_count=(
+            "asin_promo_start_week",
+            "size",
+        ),
+        earliest_matched_start=(
+            "asin_promo_start_week",
+            "min",
+        ),
+        latest_matched_start=(
+            "asin_promo_start_week",
+            "max",
+        ),
+        earliest_matched_end=(
+            "asin_promo_end_week",
+            "min",
+        ),
+        latest_matched_end=(
+            "asin_promo_end_week",
+            "max",
+        ),
+    )
+)
+
+planned = target_grid.merge(
+    planned_coverage,
+    on=[
+        "asin",
+        "order_week",
+    ],
+    how="left",
+    validate="one_to_one",
+)
+
+planned["matching_deal_count"] = (
+    planned["matching_deal_count"]
+    .fillna(0)
+    .astype(int)
+)
+
+planned["planned_ind_promotion"] = (
+    planned["matching_deal_count"] > 0
+).astype(int)
+
+
+# ============================================================
+# 7. 从 eval snapshot 读取 actual_ind_promotion
+# ============================================================
+
+required_eval_cols = {
+    "asin",
+    "order_week",
+    "ind_promotion",
+}
+
+missing_eval_cols = (
+    required_eval_cols
+    - set(eval_raw.columns)
+)
+
+if missing_eval_cols:
+    raise KeyError(
+        f"Eval table 缺少字段：{missing_eval_cols}"
+    )
+
+actual = eval_raw[
+    [
+        "asin",
+        "order_week",
+        "ind_promotion",
+    ]
+].copy()
+
+actual["asin"] = (
+    actual["asin"]
+    .astype(str)
+    .str.strip()
+)
+
+actual["order_week"] = pd.to_datetime(
+    actual["order_week"],
+    errors="coerce",
+).dt.normalize()
+
+actual["actual_ind_promotion"] = pd.to_numeric(
+    actual["ind_promotion"],
+    errors="coerce",
+)
+
+actual = actual[
+    actual["asin"].isin(set(jit_asins))
+    & actual["order_week"].isin(
+        set(TARGET_WEEKS)
+    )
+].copy()
+
+# 如果出现重复 ASIN-week，只要任意一行为 1，
+# actual_ind_promotion 就等于 1
+actual_by_week = (
+    actual
+    .groupby(
+        [
+            "asin",
+            "order_week",
+        ],
+        as_index=False,
+    )
+    .agg(
+        actual_ind_promotion=(
+            "actual_ind_promotion",
+            "max",
+        ),
+        eval_row_count=(
+            "ind_promotion",
+            "size",
+        ),
+    )
+)
+
+
+# ============================================================
+# 8. Planned 与 Actual 比较
+# ============================================================
+
+comparison = planned.merge(
+    actual_by_week,
+    on=[
+        "asin",
+        "order_week",
+    ],
+    how="left",
+    validate="one_to_one",
+)
+
+comparison["actual_ind_promotion"] = pd.to_numeric(
+    comparison["actual_ind_promotion"],
+    errors="coerce",
+)
+
+comparison["comparison_class"] = np.select(
+    [
+        comparison[
+            "actual_ind_promotion"
+        ].isna(),
+
+        (
+            comparison[
+                "planned_ind_promotion"
+            ].eq(1)
+            & comparison[
+                "actual_ind_promotion"
+            ].gt(0)
+        ),
+
+        (
+            comparison[
+                "planned_ind_promotion"
+            ].eq(0)
+            & comparison[
+                "actual_ind_promotion"
+            ].le(0)
+        ),
+
+        (
+            comparison[
+                "planned_ind_promotion"
+            ].eq(1)
+            & comparison[
+                "actual_ind_promotion"
+            ].le(0)
+        ),
+
+        (
+            comparison[
+                "planned_ind_promotion"
+            ].eq(0)
+            & comparison[
+                "actual_ind_promotion"
+            ].gt(0)
+        ),
+    ],
+    [
+        "MISSING_ACTUAL",
+        "TP",
+        "TN",
+        "FP",
+        "FN",
+    ],
+    default="UNEXPECTED",
+)
+
+comparison["is_match"] = comparison[
+    "comparison_class"
+].isin(["TP", "TN"])
+
+
+# ============================================================
+# 9. 计算 Accuracy、Precision、Recall、F1
+# ============================================================
+
+def safe_div(a, b):
+    return a / b if b else np.nan
+
+
+summary_rows = []
+
+for horizon in [
+    "ALL",
+    "H1",
+    "H2",
+    "H3",
+]:
+    if horizon == "ALL":
+        subset_all = comparison.copy()
     else:
-        coverage = (
-            matches.groupby(["asin", "order_week"], as_index=False)
-            .agg(
-                matching_deal_count=("asin_promo_start_week", "size"),
-                matched_start_week_min=("asin_promo_start_week", "min"),
-                matched_start_week_max=("asin_promo_start_week", "max"),
-                matched_end_week_min=("asin_promo_end_week", "min"),
-                matched_end_week_max=("asin_promo_end_week", "max"),
-            )
-        )
+        subset_all = comparison[
+            comparison["forecast_horizon"]
+            == horizon
+        ].copy()
 
-    plan = target_grid.merge(
-        coverage,
-        on=["asin", "order_week"],
-        how="left",
-        validate="one_to_one",
-    )
-    plan["matching_deal_count"] = (
-        plan["matching_deal_count"].fillna(0).astype(int)
-    )
-    plan["planned_ind_promotion"] = (
-        plan["matching_deal_count"] > 0
-    ).astype(int)
-    return plan
-
-
-def _build_actual_ind_promotion(
-    target_grid: pd.DataFrame,
-    eval_raw: pd.DataFrame,
-) -> pd.DataFrame:
-    required = {"asin", "order_week", "ind_promotion"}
-    missing = sorted(required - set(eval_raw.columns))
-    if missing:
-        raise KeyError(
-            "Evaluation snapshot is missing required columns: "
-            + ", ".join(missing)
-        )
-
-    actual = eval_raw[["asin", "order_week", "ind_promotion"]].copy()
-    actual["asin"] = _normalize_asin(actual["asin"])
-    actual["order_week"] = pd.to_datetime(
-        actual["order_week"], errors="coerce"
-    ).dt.normalize()
-    actual["actual_eval_ind_promotion"] = pd.to_numeric(
-        actual["ind_promotion"], errors="coerce"
-    )
-    actual = actual[
-        actual["asin"].isin(set(target_grid["asin"]))
-        & actual["order_week"].isin(set(target_grid["order_week"]))
+    subset = subset_all[
+        subset_all[
+            "actual_ind_promotion"
+        ].notna()
     ].copy()
 
-    # If the source unexpectedly contains duplicate ASIN-week rows, binary
-    # actual promotion is 1 when any duplicate says promotion=1.  The duplicate
-    # count remains visible in the output for auditing.
-    actual_by_key = (
-        actual.groupby(["asin", "order_week"], as_index=False)
-        .agg(
-            actual_eval_ind_promotion=(
-                "actual_eval_ind_promotion",
-                "max",
-            ),
-            eval_rows_for_asin_week=("ind_promotion", "size"),
+    planned_y = subset[
+        "planned_ind_promotion"
+    ].astype(int)
+
+    actual_y = subset[
+        "actual_ind_promotion"
+    ].gt(0).astype(int)
+
+    tp = int(
+        (
+            (planned_y == 1)
+            & (actual_y == 1)
+        ).sum()
+    )
+
+    tn = int(
+        (
+            (planned_y == 0)
+            & (actual_y == 0)
+        ).sum()
+    )
+
+    fp = int(
+        (
+            (planned_y == 1)
+            & (actual_y == 0)
+        ).sum()
+    )
+
+    fn = int(
+        (
+            (planned_y == 0)
+            & (actual_y == 1)
+        ).sum()
+    )
+
+    n = len(subset)
+
+    precision = safe_div(
+        tp,
+        tp + fp,
+    )
+
+    recall = safe_div(
+        tp,
+        tp + fn,
+    )
+
+    f1 = (
+        safe_div(
+            2 * precision * recall,
+            precision + recall,
         )
+        if (
+            np.isfinite(precision)
+            and np.isfinite(recall)
+            and precision + recall > 0
+        )
+        else np.nan
     )
-    return target_grid[["asin", "order_week"]].merge(
-        actual_by_key,
-        on=["asin", "order_week"],
-        how="left",
-        validate="one_to_one",
-    )
 
-
-def _safe_div(numerator: float, denominator: float) -> float:
-    return float(numerator / denominator) if denominator else np.nan
-
-
-def _summarize_binary_comparison(detail: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    groups = [("ALL", detail)] + [
-        (h, detail[detail["forecast_horizon"] == h])
-        for h in ["H1", "H2", "H3"]
-    ]
-
-    for horizon, sub_all in groups:
-        sub = sub_all[sub_all["actual_eval_ind_promotion"].notna()].copy()
-        planned = sub["planned_ind_promotion"].astype(int)
-        actual = sub["actual_eval_ind_promotion"].gt(0).astype(int)
-
-        tp = int(((planned == 1) & (actual == 1)).sum())
-        tn = int(((planned == 0) & (actual == 0)).sum())
-        fp = int(((planned == 1) & (actual == 0)).sum())
-        fn = int(((planned == 0) & (actual == 1)).sum())
-        n = len(sub)
-        precision = _safe_div(tp, tp + fp)
-        recall = _safe_div(tp, tp + fn)
-
-        rows.append({
+    summary_rows.append(
+        {
+            "data_cut": DATA_CUT,
+            "fcd": FCD,
             "forecast_horizon": horizon,
-            "expected_rows": len(sub_all),
-            "rows_with_actual": n,
-            "missing_actual_rows": int(
-                sub_all["actual_eval_ind_promotion"].isna().sum()
+
+            "expected_rows": len(
+                subset_all
             ),
-            "planned_positive_count": int(planned.sum()),
-            "actual_positive_count": int(actual.sum()),
+
+            "rows_with_actual": n,
+
+            "missing_actual_rows": int(
+                subset_all[
+                    "actual_ind_promotion"
+                ].isna().sum()
+            ),
+
+            "planned_positive_count": int(
+                planned_y.sum()
+            ),
+
+            "actual_positive_count": int(
+                actual_y.sum()
+            ),
+
             "tp": tp,
             "tn": tn,
             "fp": fp,
             "fn": fn,
-            "planned_deal_rate": _safe_div(int(planned.sum()), n),
-            "actual_deal_rate": _safe_div(int(actual.sum()), n),
-            "mismatch_rate": _safe_div(fp + fn, n),
-            "agreement_accuracy": _safe_div(tp + tn, n),
+
+            "planned_deal_rate": safe_div(
+                planned_y.sum(),
+                n,
+            ),
+
+            "actual_deal_rate": safe_div(
+                actual_y.sum(),
+                n,
+            ),
+
+            "mismatch_rate": safe_div(
+                fp + fn,
+                n,
+            ),
+
+            "agreement_accuracy": safe_div(
+                tp + tn,
+                n,
+            ),
+
             "precision": precision,
             "recall": recall,
-            "f1": (
-                _safe_div(2 * precision * recall, precision + recall)
-                if np.isfinite(precision)
-                and np.isfinite(recall)
-                and precision + recall > 0
-                else np.nan
-            ),
-        })
-    return pd.DataFrame(rows)
-
-
-def compare_current_fcd_ind_promotion(
-    asin_csv_path: str | Path | None = None,
-    output_dir: str | Path = "jit_current_fcd_promo_comparison",
-    data_cut: str | pd.Timestamp = DEFAULT_DATA_CUT,
-    bucket: str = S3_BUCKET,
-    data_prefix: str = MODEL_DATA_PREFIX,
-    deals_prefix: str = DEALS_PREFIX,
-) -> dict[str, object]:
-    """Run the planned-vs-actual comparison for the supplied JIT ASIN cohort."""
-    data_cut = pd.Timestamp(data_cut).normalize()
-    fcd = data_cut + pd.Timedelta(days=1)
-    target_weeks = [
-        fcd,
-        fcd + pd.Timedelta(days=7),
-        fcd + pd.Timedelta(days=14),
-    ]
-
-    asin_path = _resolve_asin_csv(asin_csv_path)
-    cohort_raw = pd.read_csv(asin_path)
-    asin_col = _find_asin_column(cohort_raw)
-    asins = sorted(
-        set(_normalize_asin(cohort_raw[asin_col].dropna())) - {"", "nan"}
-    )
-    if not asins:
-        raise RuntimeError(f"No ASINs were found in {asin_path}")
-
-    print("=" * 100)
-    print("CURRENT-FCD PLANNED VS ACTUAL IND_PROMOTION")
-    print("=" * 100)
-    print(f"ASIN cohort CSV: {asin_path}")
-    print(f"Unique ASINs: {len(asins):,}")
-    print(f"Data cut / plan snapshot: {data_cut.date()}")
-    print(f"FCD: {fcd.date()}")
-    print(
-        "Target weeks: "
-        + ", ".join(
-            f"H{i + 1}={week.date()}" for i, week in enumerate(target_weeks)
-        )
+            "f1": f1,
+        }
     )
 
-    s3_client = boto3.client("s3")
-    deals_key = _find_deals_snapshot_key(
-        data_cut, bucket, deals_prefix, s3_client
-    )
-    eval_cut, eval_key = _find_eval_snapshot_key(
-        data_cut, bucket, data_prefix, s3_client
-    )
-    print(f"Evaluation snapshot: {eval_cut.date()}")
+summary = pd.DataFrame(summary_rows)
 
-    deals_raw = _read_s3_csv(bucket, deals_key, s3_client)
-    eval_raw = _read_s3_csv(bucket, eval_key, s3_client)
 
-    target_grid = _build_target_grid(asins, fcd)
-    plan = _build_planned_ind_promotion(target_grid, deals_raw)
-    actual = _build_actual_ind_promotion(target_grid, eval_raw)
-    detail = plan.merge(
-        actual,
-        on=["asin", "order_week"],
-        how="left",
-        validate="one_to_one",
+# ============================================================
+# 10. 严格检查 order_week
+# ============================================================
+
+assert len(comparison) == expected_rows
+
+asin_week_count = (
+    comparison
+    .groupby("asin")["order_week"]
+    .nunique()
+)
+
+assert asin_week_count.eq(3).all(), (
+    "至少一个 ASIN 没有完整的 H1/H2/H3"
+)
+
+observed_weeks = set(
+    comparison["order_week"].unique()
+)
+
+assert observed_weeks == set(TARGET_WEEKS), (
+    f"order_week 不匹配：{observed_weeks}"
+)
+
+
+# ============================================================
+# 11. 保存并打印结果
+# ============================================================
+
+detail_path = (
+    OUTPUT_DIR
+    / "jit_asins_planned_vs_actual_ind_promotion_detail_fcd_2025-10-05.csv"
+)
+
+summary_path = (
+    OUTPUT_DIR
+    / "jit_asins_planned_vs_actual_ind_promotion_summary_fcd_2025-10-05.csv"
+)
+
+comparison.to_csv(
+    detail_path,
+    index=False,
+)
+
+summary.to_csv(
+    summary_path,
+    index=False,
+)
+
+print("\n" + "=" * 110)
+print("PLANNED VS ACTUAL IND_PROMOTION SUMMARY")
+print("=" * 110)
+
+print(
+    summary.round(6).to_string(
+        index=False
     )
-    detail["actual_eval_ind_promotion"] = pd.to_numeric(
-        detail["actual_eval_ind_promotion"], errors="coerce"
-    )
-    detail["is_match"] = np.where(
-        detail["actual_eval_ind_promotion"].isna(),
-        np.nan,
-        detail["planned_ind_promotion"].eq(
-            detail["actual_eval_ind_promotion"].gt(0).astype(int)
-        ),
-    )
-    detail["comparison_class"] = np.select(
+)
+
+print("\nTP/TN/FP/FN by horizon:")
+
+print(
+    comparison.groupby(
         [
-            detail["actual_eval_ind_promotion"].isna(),
-            detail["planned_ind_promotion"].eq(1)
-            & detail["actual_eval_ind_promotion"].gt(0),
-            detail["planned_ind_promotion"].eq(0)
-            & detail["actual_eval_ind_promotion"].le(0),
-            detail["planned_ind_promotion"].eq(1)
-            & detail["actual_eval_ind_promotion"].le(0),
-            detail["planned_ind_promotion"].eq(0)
-            & detail["actual_eval_ind_promotion"].gt(0),
-        ],
-        ["MISSING_ACTUAL", "TP", "TN", "FP", "FN"],
-        default="UNEXPECTED",
+            "forecast_horizon",
+            "comparison_class",
+        ]
     )
-    detail["data_cut"] = data_cut
-    detail["fcd"] = fcd
-    detail["deals_s3_key"] = deals_key
-    detail["eval_s3_key"] = eval_key
+    .size()
+    .unstack(fill_value=0)
+    .to_string()
+)
 
-    expected_rows = len(asins) * 3
-    if len(detail) != expected_rows:
-        raise AssertionError(
-            f"Expected {expected_rows:,} ASIN-week rows, got {len(detail):,}."
-        )
-    per_asin_week_count = detail.groupby("asin")["order_week"].nunique()
-    if not per_asin_week_count.eq(3).all():
-        raise AssertionError("At least one ASIN does not have exactly H1-H3.")
-    observed_weeks = set(detail["order_week"].dropna().unique())
-    if observed_weeks != set(pd.to_datetime(target_weeks).values):
-        raise AssertionError(
-            f"Order-week mismatch: observed={sorted(observed_weeks)}, "
-            f"expected={target_weeks}"
-        )
+print("\nLargest mismatch samples:")
 
-    summary = _summarize_binary_comparison(detail)
-    summary.insert(0, "data_cut", data_cut)
-    summary.insert(1, "fcd", fcd)
-
-    output_dir = Path(output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    token = fcd.strftime("%Y-%m-%d")
-    detail_path = output_dir / (
-        f"jit_asins_planned_vs_actual_ind_promotion_detail_fcd_{token}.csv"
+mismatch_rows = comparison[
+    comparison["comparison_class"].isin(
+        [
+            "FP",
+            "FN",
+            "MISSING_ACTUAL",
+        ]
     )
-    summary_path = output_dir / (
-        f"jit_asins_planned_vs_actual_ind_promotion_summary_fcd_{token}.csv"
-    )
-    detail.to_csv(detail_path, index=False)
-    summary.to_csv(summary_path, index=False)
+]
 
-    print("\nBinary comparison summary:")
-    print(summary.round(6).to_string(index=False))
-    print("\nMismatch counts:")
+if mismatch_rows.empty:
+    print("No mismatches.")
+else:
     print(
-        detail.groupby(
-            ["forecast_horizon", "comparison_class"],
-            dropna=False,
-        ).size().unstack(fill_value=0).to_string()
-    )
-    print(f"\nSaved detail:  {detail_path}")
-    print(f"Saved summary: {summary_path}")
-
-    return {
-        "summary": summary,
-        "detail": detail,
-        "asin_csv_path": str(asin_path),
-        "detail_path": str(detail_path),
-        "summary_path": str(summary_path),
-        "deals_s3_key": deals_key,
-        "eval_s3_key": eval_key,
-    }
-
-
-def _main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Compare planned and actual ind_promotion for the current FCD "
-            "using ASINs from a local cohort CSV."
-        )
-    )
-    parser.add_argument(
-        "--asin-csv",
-        default=None,
-        help=(
-            "Path to the JIT ASIN cohort CSV. If omitted, the script looks "
-            f"for exactly one {DEFAULT_ASIN_FILE_GLOB!r} file in the current directory."
-        ),
-    )
-    parser.add_argument(
-        "--output-dir",
-        default="jit_current_fcd_promo_comparison",
-    )
-    parser.add_argument("--data-cut", default=DEFAULT_DATA_CUT)
-    args = parser.parse_args()
-    compare_current_fcd_ind_promotion(
-        asin_csv_path=args.asin_csv,
-        output_dir=args.output_dir,
-        data_cut=args.data_cut,
+        mismatch_rows[
+            [
+                "asin",
+                "order_week",
+                "forecast_horizon",
+                "planned_ind_promotion",
+                "actual_ind_promotion",
+                "comparison_class",
+                "matching_deal_count",
+                "earliest_matched_start",
+                "latest_matched_start",
+                "earliest_matched_end",
+                "latest_matched_end",
+            ]
+        ]
+        .head(30)
+        .to_string(index=False)
     )
 
+print("\nSaved detail:", detail_path)
+print("Saved summary:", summary_path)
 
-if __name__ == "__main__":
-    _main()
-
-
-# Jupyter usage:
-# result = compare_current_fcd_ind_promotion(
-#     asin_csv_path="/path/to/jit_asins_top90pct_demand_....csv",
-#     output_dir="jit_current_fcd_promo_comparison",
-# )
+result = {
+    "summary": summary,
+    "detail": comparison,
+    "detail_path": str(detail_path),
+    "summary_path": str(summary_path),
+}
