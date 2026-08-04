@@ -20,8 +20,8 @@ Planned-deals leakage patch:
   - for each rolling cut, optionally reads the ASIN deals snapshot that existed
     on that cut date;
   - maps each ASIN's H1-H3 order week to a deal interval;
-  - replaces only ind_promotion, promotion_pricing_amount, and pricing_type in
-    the evaluation rows before model preprocessing;
+  - replaces only ind_promotion in the evaluation rows before preprocessing;
+  - promotion_pricing_amount and pricing_type are excluded from future_context;
   - retains the evaluation-snapshot values only in a separate diagnostic table
     so planned-versus-realized differences can be inspected.
 """
@@ -734,13 +734,9 @@ def _select_stock_decoder_extra_cols(data_raw):
 
     We keep a conservative list to avoid leakage-prone realized future outcomes.
     """
-    # Top-3 ablation choice for the external exposure / in-stock decoder.
-    # These are the only additional stock_extra__ features added to future_context.
-    candidate_cols = [
-        "ind_promotion",
-        "promotion_pricing_amount",
-        "pricing_type",
-    ]
+    # Leakage-controlled choice for the external exposure / in-stock decoder.
+    # This is the only additional stock_extra__ feature added to future_context.
+    candidate_cols = ["ind_promotion"]
 
     # Avoid realized target / future outcome columns.
     exclude_cols = {
@@ -761,7 +757,7 @@ def _select_stock_decoder_extra_cols(data_raw):
 
 
 def _encode_stock_decoder_extra_features(df, extra_cols):
-    """Encode the three fixed stock-decoder context fields."""
+    """Encode the selected stock-decoder context fields."""
     out_cols = []
 
     for c in extra_cols:
@@ -776,25 +772,6 @@ def _encode_stock_decoder_extra_features(df, extra_cols):
             std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
             mean = float(val.mean())
             df[new_c] = ((val - mean) / std).clip(-5, 5)
-
-        elif c == "promotion_pricing_amount":
-            val = pd.to_numeric(raw, errors="coerce").fillna(0.0)
-            val = np.log1p(val.clip(lower=0))
-            std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
-            mean = float(val.mean())
-            df[new_c] = ((val - mean) / std).clip(-5, 5)
-
-        elif c == "pricing_type":
-            if pd.api.types.is_numeric_dtype(df[c]):
-                val = pd.to_numeric(raw, errors="coerce").fillna(0.0)
-                val = np.log1p(val.clip(lower=0))
-                std = float(val.std()) if float(val.std()) > 1e-8 else 1.0
-                mean = float(val.mean())
-                df[new_c] = ((val - mean) / std).clip(-5, 5)
-            else:
-                codes, uniques = pd.factorize(raw.astype(str).fillna("MISSING"))
-                denom = max(len(uniques) - 1, 1)
-                df[new_c] = codes.astype(float) / denom
 
         else:
             raise ValueError(f"Unexpected stock decoder feature: {c}")
@@ -3902,8 +3879,6 @@ ROLLING_SCOT_PREFIX = "amxl-asin-forecast-intern/scotforecast/"
 ROLLING_DEALS_PREFIX = "amxl-asin-forecast-intern/asin_deals/"
 PLANNED_PROMO_COLS = [
     "ind_promotion",
-    "promotion_pricing_amount",
-    "pricing_type",
 ]
 
 
@@ -4056,23 +4031,18 @@ def _apply_origin_planned_deals_to_h3(
 ):
     """Replace eval-time promotion inputs with origin-time H1-H3 plans.
 
-    ``data_raw1`` still supplies realized demand/DPH/OOS targets.  Only the
-    three promotion inputs in ``PLANNED_PROMO_COLS`` are replaced.  A deal is
+    ``data_raw1`` still supplies realized demand/DPH/OOS targets.  Only
+    ``ind_promotion`` is replaced.  A deal is
     active for an ASIN/week when the target week lies within its inclusive
     ``asin_promo_start_week``/``asin_promo_end_week`` interval.
 
-    If multiple deals cover the same ASIN/week, choose the deal with the most
-    recent start week, then the latest end week, then the largest non-null
-    promotion pricing amount.  This deterministic rule uses only the current
-    cut's deals snapshot.
+    Multiple overlapping deals still produce the same binary value of 1.
     """
     required_eval = {"asin", "order_week", *PLANNED_PROMO_COLS}
     required_deals = {
         "asin",
         "asin_promo_start_week",
         "asin_promo_end_week",
-        "promotion_pricing_amount",
-        "pricing_type",
     }
     missing_eval = sorted(required_eval - set(data_raw1.columns))
     missing_deals = sorted(required_deals - set(deals_raw.columns))
@@ -4092,11 +4062,6 @@ def _apply_origin_planned_deals_to_h3(
     out["order_week"] = pd.to_datetime(
         out["order_week"], errors="coerce"
     ).dt.normalize()
-    # A planned deals table commonly stores pricing_type as text even when an
-    # evaluation snapshot encoded it numerically.  Use object dtype before the
-    # H1-H3 replacement so pandas cannot coerce plan labels to missing values.
-    out["pricing_type"] = out["pricing_type"].astype(object)
-
     normalized_target_weeks = [
         pd.Timestamp(w).normalize() for w in target_weeks
     ]
@@ -4131,10 +4096,6 @@ def _apply_origin_planned_deals_to_h3(
     deals["asin_promo_end_week"] = pd.to_datetime(
         deals["asin_promo_end_week"], errors="coerce"
     ).dt.normalize()
-    deals["promotion_pricing_amount"] = pd.to_numeric(
-        deals["promotion_pricing_amount"], errors="coerce"
-    )
-
     selected_asins = set(target_keys["asin"])
     deals = deals[
         deals["asin"].isin(selected_asins)
@@ -4148,8 +4109,6 @@ def _apply_origin_planned_deals_to_h3(
         "asin",
         "asin_promo_start_week",
         "asin_promo_end_week",
-        "promotion_pricing_amount",
-        "pricing_type",
     ]
     candidates = target_keys.merge(
         deals[deal_cols],
@@ -4172,9 +4131,6 @@ def _apply_origin_planned_deals_to_h3(
     if matches.empty:
         chosen = pd.DataFrame(columns=deal_cols + ["order_week"])
     else:
-        matches["_amount_sort"] = matches[
-            "promotion_pricing_amount"
-        ].fillna(-np.inf)
         chosen = (
             matches.sort_values(
                 [
@@ -4182,13 +4138,11 @@ def _apply_origin_planned_deals_to_h3(
                     "order_week",
                     "asin_promo_start_week",
                     "asin_promo_end_week",
-                    "_amount_sort",
                 ],
-                ascending=[True, True, False, False, False],
+                ascending=[True, True, False, False],
                 kind="mergesort",
             )
             .drop_duplicates(["asin", "order_week"], keep="first")
-            .drop(columns=["_amount_sort"])
         )
 
     plan = target_keys.merge(
@@ -4198,8 +4152,6 @@ def _apply_origin_planned_deals_to_h3(
                 "order_week",
                 "asin_promo_start_week",
                 "asin_promo_end_week",
-                "promotion_pricing_amount",
-                "pricing_type",
             ]
         ],
         on=["asin", "order_week"],
@@ -4217,15 +4169,6 @@ def _apply_origin_planned_deals_to_h3(
     plan["planned_ind_promotion"] = (
         plan["matching_deal_count"] > 0
     ).astype(float)
-    plan["planned_promotion_pricing_amount"] = pd.to_numeric(
-        plan["promotion_pricing_amount"], errors="coerce"
-    ).fillna(0.0)
-    plan["planned_pricing_type"] = plan["pricing_type"].where(
-        plan["planned_ind_promotion"].eq(1.0)
-        & plan["pricing_type"].notna(),
-        "NO_DEAL",
-    )
-
     actual = out.loc[
         target_mask,
         ["asin", "order_week", *PLANNED_PROMO_COLS],
@@ -4243,8 +4186,6 @@ def _apply_origin_planned_deals_to_h3(
                 "asin_promo_end_week",
                 "matching_deal_count",
                 "planned_ind_promotion",
-                "planned_promotion_pricing_amount",
-                "planned_pricing_type",
             ]
         ],
         on=["asin", "order_week"],
@@ -4256,31 +4197,9 @@ def _apply_origin_planned_deals_to_h3(
     actual_ind = pd.to_numeric(
         diagnostic["actual_eval_ind_promotion"], errors="coerce"
     )
-    actual_amount = pd.to_numeric(
-        diagnostic["actual_eval_promotion_pricing_amount"], errors="coerce"
-    )
     diagnostic["ind_promotion_diff_plan_minus_actual"] = (
         diagnostic["planned_ind_promotion"] - actual_ind
     )
-    diagnostic["promotion_amount_diff_plan_minus_actual"] = (
-        diagnostic["planned_promotion_pricing_amount"] - actual_amount
-    )
-    diagnostic["promotion_amount_abs_diff"] = diagnostic[
-        "promotion_amount_diff_plan_minus_actual"
-    ].abs()
-    actual_pricing = (
-        diagnostic["actual_eval_pricing_type"]
-        .where(diagnostic["actual_eval_pricing_type"].notna(), "MISSING")
-        .astype(str)
-        .str.strip()
-    )
-    planned_pricing = (
-        diagnostic["planned_pricing_type"]
-        .where(diagnostic["planned_pricing_type"].notna(), "MISSING")
-        .astype(str)
-        .str.strip()
-    )
-    diagnostic["pricing_type_match"] = actual_pricing.eq(planned_pricing)
 
     plan_index = plan.set_index(["asin", "order_week"])
     target_index = pd.MultiIndex.from_frame(
@@ -4289,13 +4208,6 @@ def _apply_origin_planned_deals_to_h3(
     out.loc[target_mask, "ind_promotion"] = plan_index[
         "planned_ind_promotion"
     ].reindex(target_index).to_numpy()
-    out.loc[target_mask, "promotion_pricing_amount"] = plan_index[
-        "planned_promotion_pricing_amount"
-    ].reindex(target_index).to_numpy()
-    out.loc[target_mask, "pricing_type"] = plan_index[
-        "planned_pricing_type"
-    ].reindex(target_index).to_numpy()
-
     summary_rows = []
     for horizon_label, sub in [
         ("ALL", diagnostic),
@@ -4307,14 +4219,22 @@ def _apply_origin_planned_deals_to_h3(
         sub_actual_ind = pd.to_numeric(
             sub["actual_eval_ind_promotion"], errors="coerce"
         )
-        sub_actual_amount = pd.to_numeric(
-            sub["actual_eval_promotion_pricing_amount"], errors="coerce"
-        )
-        ind_abs_diff = (
-            sub["planned_ind_promotion"] - sub_actual_ind
-        ).abs()
-        amount_diff = (
-            sub["planned_promotion_pricing_amount"] - sub_actual_amount
+        planned_bin = pd.to_numeric(
+            sub["planned_ind_promotion"], errors="coerce"
+        ).fillna(0).gt(0).astype(int)
+        actual_bin = sub_actual_ind.fillna(0).gt(0).astype(int)
+        tp = int(((planned_bin == 1) & (actual_bin == 1)).sum())
+        tn = int(((planned_bin == 0) & (actual_bin == 0)).sum())
+        fp = int(((planned_bin == 1) & (actual_bin == 0)).sum())
+        fn = int(((planned_bin == 0) & (actual_bin == 1)).sum())
+        accuracy = (tp + tn) / len(sub) if len(sub) else np.nan
+        precision = tp / (tp + fp) if (tp + fp) else np.nan
+        recall = tp / (tp + fn) if (tp + fn) else np.nan
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if np.isfinite(precision) and np.isfinite(recall)
+            and (precision + recall) > 0
+            else np.nan
         )
         summary_rows.append({
             "data_cut": pd.Timestamp(data_cut).normalize(),
@@ -4323,18 +4243,15 @@ def _apply_origin_planned_deals_to_h3(
             "asins": sub["asin"].nunique(),
             "planned_deal_rate": _safe_mean(sub["planned_ind_promotion"]),
             "actual_eval_deal_rate": _safe_mean(sub_actual_ind),
-            "ind_promotion_mismatch_rate": _safe_mean(ind_abs_diff.gt(0)),
-            "planned_amount_mean": _safe_mean(
-                sub["planned_promotion_pricing_amount"]
-            ),
-            "actual_eval_amount_mean": _safe_mean(sub_actual_amount),
-            "promotion_amount_mae": _safe_mean(amount_diff.abs()),
-            "promotion_amount_mean_diff_plan_minus_actual": _safe_mean(
-                amount_diff
-            ),
-            "pricing_type_mismatch_rate": _safe_mean(
-                ~sub["pricing_type_match"]
-            ),
+            "ind_promotion_mismatch_rate": (fp + fn) / len(sub) if len(sub) else np.nan,
+            "tp": tp,
+            "tn": tn,
+            "fp": fp,
+            "fn": fn,
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
             "multiple_deal_match_rate": _safe_mean(
                 sub["matching_deal_count"].gt(1)
             ),
@@ -4359,8 +4276,6 @@ def _apply_origin_planned_deals_to_h3(
 
     mismatch_mask = (
         diagnostic["ind_promotion_diff_plan_minus_actual"].fillna(0).ne(0)
-        | diagnostic["promotion_amount_abs_diff"].fillna(0).gt(1e-9)
-        | ~diagnostic["pricing_type_match"]
     )
     mismatch_preview = diagnostic.loc[
         mismatch_mask,
@@ -4370,18 +4285,9 @@ def _apply_origin_planned_deals_to_h3(
             "forecast_horizon",
             "actual_eval_ind_promotion",
             "planned_ind_promotion",
-            "actual_eval_promotion_pricing_amount",
-            "planned_promotion_pricing_amount",
-            "promotion_amount_diff_plan_minus_actual",
-            "actual_eval_pricing_type",
-            "planned_pricing_type",
             "matching_deal_count",
         ],
-    ].sort_values(
-        "promotion_amount_diff_plan_minus_actual",
-        key=lambda s: s.abs(),
-        ascending=False,
-    )
+    ].sort_values(["forecast_horizon", "asin"])
     print("\nLargest planned-vs-eval mismatches (up to 20 rows):", flush=True)
     if mismatch_preview.empty:
         print("No differences found.", flush=True)
@@ -4489,9 +4395,9 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
       4. Randomly sample n_asins from that fully joined cohort.
       5. Train the unchanged Joint H3 V1.2 model.
       6. Evaluate P50, P70, and P90 with the existing standardized WAPE pipeline.
-      7. Optionally replace only the H1-H3 promotion inputs with the ASIN
-         deals snapshot available at the current data cut and report their
-         differences from the later evaluation-snapshot values.
+      7. Optionally replace only H1-H3 ind_promotion with the ASIN deals
+         snapshot available at the current data cut and report its difference
+         from the later evaluation-snapshot value.
       8. Save exactly one prediction.csv after each completed cut.
 
     CSV export does not change model training, inference, or WAPE calculations.
@@ -4503,7 +4409,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
         raise ValueError(
             "Set resume_existing=False when use_origin_planned_deals=True; "
             "an older cached prediction may have been trained with eval-time "
-            "promotion inputs."
+            "ind_promotion."
         )
 
     run_asin_set, cohort_mode, resolved_jit_path = _resolve_run_asin_cohort(
@@ -5122,12 +5028,10 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                     "planned_vs_actual_ind_mismatch_rate": promo_all[
                         "ind_promotion_mismatch_rate"
                     ],
-                    "planned_vs_actual_amount_mae": promo_all[
-                        "promotion_amount_mae"
-                    ],
-                    "planned_vs_actual_pricing_type_mismatch_rate": promo_all[
-                        "pricing_type_mismatch_rate"
-                    ],
+                    "planned_vs_actual_ind_accuracy": promo_all["accuracy"],
+                    "planned_vs_actual_ind_precision": promo_all["precision"],
+                    "planned_vs_actual_ind_recall": promo_all["recall"],
+                    "planned_vs_actual_ind_f1": promo_all["f1"],
                 })
 
             summary_rows.append(summary)
@@ -5366,9 +5270,9 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 #   deals    = asin_deals_20251004.csv000
 #
 # The later evaluation snapshot still supplies actual demand/DPH/OOS labels.
-# Immediately before model preprocessing, only these three H1-H3 inputs are
-# replaced with the current-cut deals plan:
-#   ind_promotion, promotion_pricing_amount, pricing_type
+# Immediately before model preprocessing, only H1-H3 ind_promotion is
+# replaced with the current-cut deals plan. promotion_pricing_amount and
+# pricing_type are excluded from future_context entirely.
 #
 # Two diagnostics are written under output_root before model training:
 #   planned_vs_eval_promotion_cut_2025-10-04.csv
