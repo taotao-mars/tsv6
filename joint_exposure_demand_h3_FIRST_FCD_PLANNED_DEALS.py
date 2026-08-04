@@ -30,6 +30,7 @@ import os
 import time
 import multiprocessing as mp
 import random
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -426,27 +427,110 @@ def _evaluate_standard_wape_against_scot(
 # =====================================================
 CHRIS_DF_PATH = "asin_list_from_amxl_fcst_scot_to_chris_20260723.csv"
 
-if not os.path.exists(CHRIS_DF_PATH):
-    raise FileNotFoundError(
-        f"Chris ASIN cohort file not found: {CHRIS_DF_PATH}. "
-        "Place the CSV in the current working directory."
+if os.path.exists(CHRIS_DF_PATH):
+    _chris_df = pd.read_csv(CHRIS_DF_PATH, usecols=["asin"])
+    CHRIS_ASIN_SET = set(
+        _chris_df["asin"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .unique()
+    )
+    del _chris_df
+    print(
+        f"[CHRIS-BASELINE] loaded {len(CHRIS_ASIN_SET):,} unique ASINs "
+        f"from {CHRIS_DF_PATH}",
+        flush=True,
+    )
+else:
+    # A JIT-only run must not fail merely because the legacy Chris cohort is
+    # absent. Chris/union modes validate this set when they are requested.
+    CHRIS_ASIN_SET = set()
+    print(
+        f"[CHRIS-BASELINE] optional file not found: {CHRIS_DF_PATH}",
+        flush=True,
     )
 
-_chris_df = pd.read_csv(CHRIS_DF_PATH, usecols=["asin"])
-CHRIS_ASIN_SET = set(
-    _chris_df["asin"]
-    .dropna()
-    .astype(str)
-    .str.strip()
-    .unique()
-)
-del _chris_df
 
-print(
-    f"[CHRIS-BASELINE] loaded {len(CHRIS_ASIN_SET):,} unique ASINs "
-    f"from {CHRIS_DF_PATH}",
-    flush=True,
-)
+# =====================================================
+# Optional JIT ASIN cohort used by the first-FCD planned-deals run
+# =====================================================
+DEFAULT_JIT_ASIN_GLOB = "jit_asins_top90pct_demand*.csv"
+
+
+def _resolve_jit_asin_csv(jit_asin_path=None):
+    """Resolve the JIT cohort CSV without depending on notebook argv."""
+    if jit_asin_path is not None:
+        path = Path(jit_asin_path).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"JIT ASIN cohort CSV not found: {path}")
+        return path
+
+    search_roots = [Path.cwd(), Path("/home/sagemaker-user")]
+    matches = []
+    for root in search_roots:
+        if root.exists():
+            matches.extend(root.glob(DEFAULT_JIT_ASIN_GLOB))
+
+    # De-duplicate when cwd is /home/sagemaker-user.
+    matches = sorted({p.resolve() for p in matches if p.is_file()})
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise FileNotFoundError(
+            "No JIT ASIN cohort CSV was found. Put "
+            f"{DEFAULT_JIT_ASIN_GLOB} beside the notebook, or pass "
+            "jit_asin_path=... to the rolling function."
+        )
+    raise RuntimeError(
+        "Multiple JIT ASIN cohort CSVs were found. Pass jit_asin_path "
+        "explicitly:\n  " + "\n  ".join(str(p) for p in matches)
+    )
+
+
+def _load_jit_asin_set(jit_asin_path=None):
+    path = _resolve_jit_asin_csv(jit_asin_path)
+    header = pd.read_csv(path, nrows=0)
+    by_lower = {str(c).strip().lower(): c for c in header.columns}
+    if "asin" not in by_lower:
+        raise KeyError(
+            f"JIT cohort CSV must contain an ASIN column: {path}; "
+            f"columns={list(header.columns)}"
+        )
+    asin_col = by_lower["asin"]
+    frame = pd.read_csv(path, usecols=[asin_col])
+    asin_set = set(
+        frame[asin_col].dropna().astype(str).str.strip().loc[lambda s: s.ne("")]
+    )
+    if not asin_set:
+        raise RuntimeError(f"JIT cohort contains zero usable ASINs: {path}")
+    print(
+        f"[JIT-COHORT] loaded {len(asin_set):,} unique ASINs from {path}",
+        flush=True,
+    )
+    return asin_set, path
+
+
+def _resolve_run_asin_cohort(asin_cohort="chris", jit_asin_path=None):
+    """Return the requested model cohort: chris, jit, or their union."""
+    mode = str(asin_cohort).strip().lower()
+    if mode == "chris":
+        if not CHRIS_ASIN_SET:
+            raise FileNotFoundError(
+                f"Chris cohort mode requested, but {CHRIS_DF_PATH} was not found."
+            )
+        return set(CHRIS_ASIN_SET), "chris", None
+    if mode not in {"jit", "union"}:
+        raise ValueError("asin_cohort must be one of: 'chris', 'jit', 'union'.")
+
+    jit_set, resolved_path = _load_jit_asin_set(jit_asin_path)
+    if mode == "jit":
+        return jit_set, "jit", resolved_path
+    if not CHRIS_ASIN_SET:
+        raise FileNotFoundError(
+            f"Union cohort mode requested, but {CHRIS_DF_PATH} was not found."
+        )
+    return set(CHRIS_ASIN_SET) | jit_set, "union", resolved_path
 
 # =====================================================
 # GPU / device
@@ -3806,7 +3890,6 @@ def print_exposure_hat_diagnostics(
 
 import io
 import re
-from pathlib import Path
 import boto3
 
 
@@ -4393,6 +4476,8 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     scot_prefix=ROLLING_SCOT_PREFIX,
     use_origin_planned_deals=False,
     planned_deals_prefix=ROLLING_DEALS_PREFIX,
+    asin_cohort="chris",
+    jit_asin_path=None,
 ):
     """
     Rolling Joint H3 evaluation.
@@ -4400,7 +4485,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
     For every matched cut:
       1. Read one feature snapshot CSV.
       2. Read the SCOT parquet whose FCD is snapshot date + 1 day.
-      3. Intersect origin, evaluation, SCOT, and Chris ASIN cohorts.
+      3. Intersect origin, evaluation, SCOT, and the requested ASIN cohort.
       4. Randomly sample n_asins from that fully joined cohort.
       5. Train the unchanged Joint H3 V1.2 model.
       6. Evaluate P50, P70, and P90 with the existing standardized WAPE pipeline.
@@ -4420,6 +4505,11 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             "an older cached prediction may have been trained with eval-time "
             "promotion inputs."
         )
+
+    run_asin_set, cohort_mode, resolved_jit_path = _resolve_run_asin_cohort(
+        asin_cohort=asin_cohort,
+        jit_asin_path=jit_asin_path,
+    )
 
     missing_wape_helpers = [
         name
@@ -4490,6 +4580,10 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
         "Origin-time planned deals patch:",
         "ON" if use_origin_planned_deals else "OFF",
     )
+    print("ASIN cohort mode:", cohort_mode)
+    print("Requested cohort ASINs:", f"{len(run_asin_set):,}")
+    if resolved_jit_path is not None:
+        print("JIT cohort CSV:", resolved_jit_path)
 
     summary_rows = []
     all_forecasts = []
@@ -4550,19 +4644,19 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             )
 
             # Build the fully joined eligible cohort FIRST:
-            # origin snapshot ∩ evaluation snapshot ∩ SCOT ∩ Chris.
+            # origin snapshot ∩ evaluation snapshot ∩ SCOT ∩ requested cohort.
             # Only after that intersection do we apply n_asins sampling.
             origin_set = set(origin_raw["asin"].dropna().unique())
             scot_set = set(scot_df["asin"].dropna().unique())
             eval_set = set(eval_raw["asin"].dropna().unique())
             eligible_joint_asins = sorted(
-                origin_set & scot_set & eval_set & CHRIS_ASIN_SET
+                origin_set & scot_set & eval_set & run_asin_set
             )
 
             print(
-                f"[CHRIS-JOINT] eligible before sampling | "
+                f"[COHORT-JOINT:{cohort_mode}] eligible before sampling | "
                 f"origin={len(origin_set):,} | scot={len(scot_set):,} | "
-                f"eval={len(eval_set):,} | chris={len(CHRIS_ASIN_SET):,} | "
+                f"eval={len(eval_set):,} | requested={len(run_asin_set):,} | "
                 f"joint={len(eligible_joint_asins):,}",
                 flush=True,
             )
@@ -4570,7 +4664,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
             if not eligible_joint_asins:
                 raise RuntimeError(
                     "No ASINs remain after origin, evaluation, SCOT, and "
-                    "Chris intersection."
+                    f"{cohort_mode} cohort intersection."
                 )
 
             if n_asins is None:
@@ -4586,7 +4680,7 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
                 )
 
             print(
-                f"[CHRIS-JOINT] after n_asins sampling | "
+                f"[COHORT-JOINT:{cohort_mode}] after n_asins sampling | "
                 f"requested={'ALL' if n_asins is None else int(n_asins):} | "
                 f"selected={len(rolling_asins):,}",
                 flush=True,
@@ -5282,23 +5376,33 @@ def run_joint_h3_s3_rolling_scot_p50_p70(
 # resume_existing=False is required so an older unpatched prediction is never
 # reused for this experiment.
 #
-# first_fcd_planned_deals = run_joint_h3_s3_rolling_scot_p50_p70(
-#     n_asins=5000,
-#     seed=42,
-#     max_snapshots=1,
-#     select_latest=False,
-#     start_date="2025-10-04",
-#     end_date="2025-10-04",
-#     epochs=60,
-#     patience=6,
-#     history=52,
-#     horizon=3,
-#     batch_size=64,
-#     lambda_exposure=0.50,
-#     detach_exposure_for_demand=False,
-#     output_root="joint_h3_first_fcd_planned_deals_5000",
-#     resume_existing=False,
-#     continue_on_error=False,
-#     use_origin_planned_deals=True,
-#     planned_deals_prefix=ROLLING_DEALS_PREFIX,
-# )
+# Run this cell/call after loading the file. It uses every eligible ASIN from
+# the new JIT cohort (7,137 in the supplied comparison), rather than randomly
+# sampling 5,000 from the old Chris cohort.
+#
+# If auto-discovery finds more than one matching CSV, set the exact path below:
+# JIT_ASIN_CSV_PATH = "/home/sagemaker-user/jit_asins_top90pct_demand_....csv"
+JIT_ASIN_CSV_PATH = None
+
+first_fcd_planned_deals_jit = run_joint_h3_s3_rolling_scot_p50_p70(
+    n_asins=None,
+    seed=42,
+    max_snapshots=1,
+    select_latest=False,
+    start_date="2025-10-04",
+    end_date="2025-10-04",
+    epochs=60,
+    patience=6,
+    history=52,
+    horizon=3,
+    batch_size=64,
+    lambda_exposure=0.50,
+    detach_exposure_for_demand=False,
+    output_root="joint_h3_first_fcd_planned_deals_jit_all",
+    resume_existing=False,
+    continue_on_error=False,
+    use_origin_planned_deals=True,
+    planned_deals_prefix=ROLLING_DEALS_PREFIX,
+    asin_cohort="jit",
+    jit_asin_path=JIT_ASIN_CSV_PATH,
+)
