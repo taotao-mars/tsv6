@@ -1,0 +1,972 @@
+import io
+import re
+from pathlib import Path
+
+import boto3
+import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+S3_BUCKET = "amxl-asin-forecast590184089576"
+
+DEALS_KEY = (
+    "amxl-asin-forecast-intern/asin_deals/"
+    "asin_deals_20251004.csv000"
+)
+
+EVAL_PREFIX = (
+    "amxl-asin-forecast-intern/data_for_model/"
+    "df_head_body_add_holiday_2025-10-25"
+)
+
+DATA_CUT = pd.Timestamp("2025-10-04")
+FCD = pd.Timestamp("2025-10-05")
+
+TARGET_WEEKS = {
+    pd.Timestamp("2025-10-05"): "H1",
+    pd.Timestamp("2025-10-12"): "H2",
+    pd.Timestamp("2025-10-19"): "H3",
+}
+
+# 如果当前目录只有一个 jit_asins_top90pct_demand*.csv，
+# 保持 None 即可自动读取。
+JIT_ASIN_CSV_PATH = None
+
+OUTPUT_DIR = Path(
+    "planned_vs_actual_all3_features_first_fcd"
+)
+
+# 金额浮点数比较容差
+AMOUNT_ATOL = 1e-6
+AMOUNT_RTOL = 1e-6
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def normalize_asin(series):
+    return series.astype(str).str.strip()
+
+
+def find_asin_column(df):
+    columns = {
+        str(c).strip().lower(): c
+        for c in df.columns
+    }
+
+    if "asin" not in columns:
+        raise KeyError(
+            "JIT CSV must contain an ASIN column. "
+            f"Available columns: {list(df.columns)}"
+        )
+
+    return columns["asin"]
+
+
+def resolve_jit_asin_csv(path=None):
+    if path is not None:
+        result = Path(path).expanduser().resolve()
+
+        if not result.is_file():
+            raise FileNotFoundError(
+                f"JIT ASIN CSV not found: {result}"
+            )
+
+        return result
+
+    matches = []
+
+    for root in [Path.cwd(), Path("/home/sagemaker-user")]:
+        if root.exists():
+            matches.extend(
+                root.glob("jit_asins_top90pct_demand*.csv")
+            )
+
+    matches = sorted({
+        p.resolve()
+        for p in matches
+        if p.is_file()
+    })
+
+    if len(matches) == 1:
+        return matches[0]
+
+    if len(matches) == 0:
+        raise FileNotFoundError(
+            "Cannot find jit_asins_top90pct_demand*.csv. "
+            "Set JIT_ASIN_CSV_PATH to the exact file path."
+        )
+
+    raise RuntimeError(
+        "Multiple JIT ASIN CSV files found. "
+        "Set JIT_ASIN_CSV_PATH explicitly:\n  "
+        + "\n  ".join(str(p) for p in matches)
+    )
+
+
+def list_s3_keys(s3_client, bucket, prefix):
+    keys = []
+
+    paginator = s3_client.get_paginator(
+        "list_objects_v2"
+    )
+
+    for page in paginator.paginate(
+        Bucket=bucket,
+        Prefix=prefix,
+    ):
+        for obj in page.get("Contents", []):
+            key = obj.get("Key")
+
+            if key:
+                keys.append(key)
+
+    return keys
+
+
+def resolve_eval_key(s3_client):
+    pattern = re.compile(
+        r"df_head_body_add_holiday_"
+        r"2025-10-25_?ETLM_[vV]3\.csv$"
+    )
+
+    matching_keys = [
+        key
+        for key in list_s3_keys(
+            s3_client,
+            S3_BUCKET,
+            EVAL_PREFIX,
+        )
+        if pattern.search(key)
+    ]
+
+    if len(matching_keys) != 1:
+        raise RuntimeError(
+            "Expected exactly one 2025-10-25 eval file, "
+            f"but found {len(matching_keys)}:\n"
+            + "\n".join(matching_keys)
+        )
+
+    return matching_keys[0]
+
+
+def read_s3_csv(
+    s3_client,
+    key,
+    usecols=None,
+):
+    print(
+        f"\nReading s3://{S3_BUCKET}/{key}",
+        flush=True,
+    )
+
+    body = s3_client.get_object(
+        Bucket=S3_BUCKET,
+        Key=key,
+    )["Body"].read()
+
+    frame = pd.read_csv(
+        io.BytesIO(body),
+        usecols=usecols,
+        low_memory=False,
+    )
+
+    print(
+        f"Loaded rows={len(frame):,}, "
+        f"columns={len(frame.columns)}",
+        flush=True,
+    )
+
+    return frame
+
+
+def normalize_pricing_type(value):
+    """
+    Normalize values such as:
+        1, 1.0, "1", "1.0"
+    to the same representation.
+    """
+    if pd.isna(value):
+        return "MISSING"
+
+    text = str(value).strip()
+
+    if text == "":
+        return "MISSING"
+
+    try:
+        numeric_value = float(text)
+
+        if np.isfinite(numeric_value):
+            return f"{numeric_value:g}"
+    except (TypeError, ValueError):
+        pass
+
+    return text.upper()
+
+
+# ============================================================
+# Load JIT ASIN cohort
+# ============================================================
+
+jit_path = resolve_jit_asin_csv(
+    JIT_ASIN_CSV_PATH
+)
+
+jit_header = pd.read_csv(
+    jit_path,
+    nrows=0,
+)
+
+jit_asin_col = find_asin_column(
+    jit_header
+)
+
+jit_df = pd.read_csv(
+    jit_path,
+    usecols=[jit_asin_col],
+)
+
+jit_asins = sorted(
+    set(
+        normalize_asin(
+            jit_df[jit_asin_col].dropna()
+        )
+    )
+)
+
+print("=" * 90)
+print("JIT ASIN COHORT")
+print("=" * 90)
+print("JIT CSV:", jit_path)
+print("Unique JIT ASINs:", f"{len(jit_asins):,}")
+
+
+# ============================================================
+# Load planned deals and actual eval data
+# ============================================================
+
+s3_client = boto3.client("s3")
+
+eval_key = resolve_eval_key(
+    s3_client
+)
+
+deals = read_s3_csv(
+    s3_client,
+    DEALS_KEY,
+    usecols=[
+        "asin",
+        "asin_promo_start_week",
+        "asin_promo_end_week",
+        "promotion_pricing_amount",
+        "pricing_type",
+    ],
+)
+
+actual = read_s3_csv(
+    s3_client,
+    eval_key,
+    usecols=[
+        "asin",
+        "order_week",
+        "ind_promotion",
+        "promotion_pricing_amount",
+        "pricing_type",
+    ],
+)
+
+
+# ============================================================
+# Build ASIN × H1/H2/H3 target grid
+# ============================================================
+
+target_grid = pd.MultiIndex.from_product(
+    [
+        jit_asins,
+        list(TARGET_WEEKS.keys()),
+    ],
+    names=[
+        "asin",
+        "order_week",
+    ],
+).to_frame(index=False)
+
+target_grid["forecast_horizon"] = (
+    target_grid["order_week"].map(TARGET_WEEKS)
+)
+
+expected_rows = len(jit_asins) * 3
+
+assert len(target_grid) == expected_rows
+
+print("\n" + "=" * 90)
+print("TARGET GRID")
+print("=" * 90)
+print("Data cut:", DATA_CUT.date())
+print("FCD:", FCD.date())
+print("H1:", pd.Timestamp("2025-10-05").date())
+print("H2:", pd.Timestamp("2025-10-12").date())
+print("H3:", pd.Timestamp("2025-10-19").date())
+print("Expected ASIN-week rows:", f"{expected_rows:,}")
+
+
+# ============================================================
+# Construct planned values
+# ============================================================
+
+deals["asin"] = normalize_asin(
+    deals["asin"]
+)
+
+deals["asin_promo_start_week"] = pd.to_datetime(
+    deals["asin_promo_start_week"],
+    errors="coerce",
+).dt.normalize()
+
+deals["asin_promo_end_week"] = pd.to_datetime(
+    deals["asin_promo_end_week"],
+    errors="coerce",
+).dt.normalize()
+
+deals["promotion_pricing_amount"] = pd.to_numeric(
+    deals["promotion_pricing_amount"],
+    errors="coerce",
+)
+
+selected_asin_set = set(jit_asins)
+
+deals = deals[
+    deals["asin"].isin(selected_asin_set)
+    & deals["asin_promo_start_week"].notna()
+    & deals["asin_promo_end_week"].notna()
+    & (
+        deals["asin_promo_start_week"]
+        <= max(TARGET_WEEKS)
+    )
+    & (
+        deals["asin_promo_end_week"]
+        >= min(TARGET_WEEKS)
+    )
+].copy()
+
+deal_columns = [
+    "asin",
+    "asin_promo_start_week",
+    "asin_promo_end_week",
+    "promotion_pricing_amount",
+    "pricing_type",
+]
+
+candidates = target_grid.merge(
+    deals[deal_columns],
+    on="asin",
+    how="left",
+)
+
+active_mask = (
+    candidates["asin_promo_start_week"].notna()
+    & (
+        candidates["order_week"]
+        >= candidates["asin_promo_start_week"]
+    )
+    & (
+        candidates["order_week"]
+        <= candidates["asin_promo_end_week"]
+    )
+)
+
+active_deals = candidates[
+    active_mask
+].copy()
+
+matching_counts = (
+    active_deals
+    .groupby(
+        [
+            "asin",
+            "order_week",
+        ],
+        as_index=False,
+    )
+    .size()
+    .rename(
+        columns={
+            "size": "matching_deal_count"
+        }
+    )
+)
+
+# 如果同一个 ASIN/week 有多个 active deals：
+# 1. 选择开始时间最接近当前目标周的 deal
+# 2. 然后选择结束时间最晚的 deal
+# 3. 然后选择 promotion amount 最大的 deal
+#
+# ind_promotion 不受这个选择影响，只要有一个 active deal 就是 1。
+if active_deals.empty:
+    selected_deals = pd.DataFrame(
+        columns=deal_columns + ["order_week"]
+    )
+else:
+    active_deals["_amount_sort"] = (
+        active_deals[
+            "promotion_pricing_amount"
+        ].fillna(-np.inf)
+    )
+
+    selected_deals = (
+        active_deals
+        .sort_values(
+            [
+                "asin",
+                "order_week",
+                "asin_promo_start_week",
+                "asin_promo_end_week",
+                "_amount_sort",
+            ],
+            ascending=[
+                True,
+                True,
+                False,
+                False,
+                False,
+            ],
+            kind="mergesort",
+        )
+        .drop_duplicates(
+            [
+                "asin",
+                "order_week",
+            ],
+            keep="first",
+        )
+        .drop(
+            columns=["_amount_sort"]
+        )
+    )
+
+planned = (
+    target_grid
+    .merge(
+        selected_deals[
+            [
+                "asin",
+                "order_week",
+                "asin_promo_start_week",
+                "asin_promo_end_week",
+                "promotion_pricing_amount",
+                "pricing_type",
+            ]
+        ],
+        on=[
+            "asin",
+            "order_week",
+        ],
+        how="left",
+        validate="one_to_one",
+    )
+    .merge(
+        matching_counts,
+        on=[
+            "asin",
+            "order_week",
+        ],
+        how="left",
+        validate="one_to_one",
+    )
+)
+
+planned["matching_deal_count"] = (
+    planned["matching_deal_count"]
+    .fillna(0)
+    .astype(int)
+)
+
+planned["planned_ind_promotion"] = (
+    planned["matching_deal_count"] > 0
+).astype(int)
+
+planned["planned_promotion_pricing_amount"] = (
+    pd.to_numeric(
+        planned["promotion_pricing_amount"],
+        errors="coerce",
+    )
+    .fillna(0.0)
+)
+
+planned["planned_pricing_type"] = np.where(
+    planned["planned_ind_promotion"].eq(1),
+    planned["pricing_type"],
+    "NO_DEAL",
+)
+
+
+# ============================================================
+# Prepare actual eval values
+# ============================================================
+
+actual["asin"] = normalize_asin(
+    actual["asin"]
+)
+
+actual["order_week"] = pd.to_datetime(
+    actual["order_week"],
+    errors="coerce",
+).dt.normalize()
+
+actual = actual[
+    actual["asin"].isin(selected_asin_set)
+    & actual["order_week"].isin(TARGET_WEEKS)
+].copy()
+
+duplicate_count = int(
+    actual.duplicated(
+        [
+            "asin",
+            "order_week",
+        ],
+        keep=False,
+    ).sum()
+)
+
+print(
+    "\nDuplicate actual ASIN-week rows:",
+    f"{duplicate_count:,}",
+)
+
+if duplicate_count > 0:
+    # Prefer an active-promotion record if duplicates exist.
+    actual["_actual_ind_sort"] = (
+        pd.to_numeric(
+            actual["ind_promotion"],
+            errors="coerce",
+        )
+        .fillna(0)
+    )
+
+    actual["_actual_amount_sort"] = (
+        pd.to_numeric(
+            actual["promotion_pricing_amount"],
+            errors="coerce",
+        )
+        .fillna(-np.inf)
+    )
+
+    actual = (
+        actual
+        .sort_values(
+            [
+                "asin",
+                "order_week",
+                "_actual_ind_sort",
+                "_actual_amount_sort",
+            ],
+            ascending=[
+                True,
+                True,
+                False,
+                False,
+            ],
+            kind="mergesort",
+        )
+        .drop_duplicates(
+            [
+                "asin",
+                "order_week",
+            ],
+            keep="first",
+        )
+        .drop(
+            columns=[
+                "_actual_ind_sort",
+                "_actual_amount_sort",
+            ]
+        )
+    )
+
+actual = actual.rename(
+    columns={
+        "ind_promotion":
+            "actual_ind_promotion",
+        "promotion_pricing_amount":
+            "actual_promotion_pricing_amount",
+        "pricing_type":
+            "actual_pricing_type",
+    }
+)
+
+
+# ============================================================
+# Join planned and actual
+# ============================================================
+
+comparison = planned.merge(
+    actual[
+        [
+            "asin",
+            "order_week",
+            "actual_ind_promotion",
+            "actual_promotion_pricing_amount",
+            "actual_pricing_type",
+        ]
+    ],
+    on=[
+        "asin",
+        "order_week",
+    ],
+    how="left",
+    validate="one_to_one",
+)
+
+comparison["missing_actual"] = (
+    comparison["actual_ind_promotion"].isna()
+)
+
+comparison["actual_ind_promotion"] = (
+    pd.to_numeric(
+        comparison["actual_ind_promotion"],
+        errors="coerce",
+    )
+)
+
+comparison["actual_promotion_pricing_amount"] = (
+    pd.to_numeric(
+        comparison[
+            "actual_promotion_pricing_amount"
+        ],
+        errors="coerce",
+    )
+)
+
+comparison["planned_pricing_type_normalized"] = (
+    comparison["planned_pricing_type"]
+    .map(normalize_pricing_type)
+)
+
+comparison["actual_pricing_type_normalized"] = (
+    comparison["actual_pricing_type"]
+    .map(normalize_pricing_type)
+)
+
+
+# ============================================================
+# Feature-level matches
+# ============================================================
+
+comparison["ind_promotion_match"] = (
+    comparison["planned_ind_promotion"]
+    == comparison["actual_ind_promotion"]
+) & ~comparison["missing_actual"]
+
+comparison["promotion_amount_match"] = (
+    np.isclose(
+        comparison[
+            "planned_promotion_pricing_amount"
+        ].fillna(0.0),
+        comparison[
+            "actual_promotion_pricing_amount"
+        ].fillna(0.0),
+        atol=AMOUNT_ATOL,
+        rtol=AMOUNT_RTOL,
+    )
+    & ~comparison["missing_actual"]
+)
+
+comparison["pricing_type_match"] = (
+    comparison[
+        "planned_pricing_type_normalized"
+    ]
+    == comparison[
+        "actual_pricing_type_normalized"
+    ]
+) & ~comparison["missing_actual"]
+
+
+# Strict:
+# 三个字段在任何情况下都必须完全一致。
+comparison["strict_all_3_features_match"] = (
+    comparison["ind_promotion_match"]
+    & comparison["promotion_amount_match"]
+    & comparison["pricing_type_match"]
+)
+
+
+# Semantic:
+# ind_promotion 必须一致。
+# 如果双方都是 0，则 amount/type 不参与判断。
+# 如果双方都是 1，则 amount/type 也必须一致。
+both_no_promotion = (
+    comparison["planned_ind_promotion"].eq(0)
+    & comparison["actual_ind_promotion"].eq(0)
+)
+
+both_have_promotion = (
+    comparison["planned_ind_promotion"].eq(1)
+    & comparison["actual_ind_promotion"].eq(1)
+)
+
+comparison["semantic_all_3_features_match"] = (
+    comparison["ind_promotion_match"]
+    & (
+        both_no_promotion
+        | (
+            both_have_promotion
+            & comparison["promotion_amount_match"]
+            & comparison["pricing_type_match"]
+        )
+    )
+)
+
+
+# ============================================================
+# H1/H2/H3 summaries
+# ============================================================
+
+weekly_summary_rows = []
+
+for horizon in ["H1", "H2", "H3"]:
+    sub = comparison[
+        comparison["forecast_horizon"] == horizon
+    ].copy()
+
+    weekly_summary_rows.append({
+        "forecast_horizon": horizon,
+        "expected_asins": len(jit_asins),
+        "actual_available_asins":
+            int((~sub["missing_actual"]).sum()),
+
+        "ind_promotion_match_asins":
+            int(sub["ind_promotion_match"].sum()),
+        "promotion_amount_match_asins":
+            int(sub["promotion_amount_match"].sum()),
+        "pricing_type_match_asins":
+            int(sub["pricing_type_match"].sum()),
+
+        "strict_all_3_match_asins":
+            int(sub["strict_all_3_features_match"].sum()),
+        "strict_all_3_match_rate":
+            float(sub["strict_all_3_features_match"].mean()),
+
+        "semantic_all_3_match_asins":
+            int(sub["semantic_all_3_features_match"].sum()),
+        "semantic_all_3_match_rate":
+            float(sub["semantic_all_3_features_match"].mean()),
+    })
+
+weekly_summary = pd.DataFrame(
+    weekly_summary_rows
+)
+
+
+# ============================================================
+# ASIN-level: require all H1/H2/H3 to match
+# ============================================================
+
+asin_summary = (
+    comparison
+    .groupby(
+        "asin",
+        as_index=False,
+    )
+    .agg(
+        weeks_found=(
+            "forecast_horizon",
+            "nunique",
+        ),
+        all_h1_h2_h3_ind_match=(
+            "ind_promotion_match",
+            "all",
+        ),
+        all_h1_h2_h3_amount_match=(
+            "promotion_amount_match",
+            "all",
+        ),
+        all_h1_h2_h3_pricing_type_match=(
+            "pricing_type_match",
+            "all",
+        ),
+        all_h1_h2_h3_strict_match=(
+            "strict_all_3_features_match",
+            "all",
+        ),
+        all_h1_h2_h3_semantic_match=(
+            "semantic_all_3_features_match",
+            "all",
+        ),
+        any_missing_actual=(
+            "missing_actual",
+            "any",
+        ),
+    )
+)
+
+valid_three_weeks = (
+    asin_summary["weeks_found"].eq(3)
+    & ~asin_summary["any_missing_actual"]
+)
+
+strict_all_weeks_count = int(
+    (
+        valid_three_weeks
+        & asin_summary[
+            "all_h1_h2_h3_strict_match"
+        ]
+    ).sum()
+)
+
+semantic_all_weeks_count = int(
+    (
+        valid_three_weeks
+        & asin_summary[
+            "all_h1_h2_h3_semantic_match"
+        ]
+    ).sum()
+)
+
+all_weeks_ind_count = int(
+    (
+        valid_three_weeks
+        & asin_summary[
+            "all_h1_h2_h3_ind_match"
+        ]
+    ).sum()
+)
+
+all_weeks_amount_count = int(
+    (
+        valid_three_weeks
+        & asin_summary[
+            "all_h1_h2_h3_amount_match"
+        ]
+    ).sum()
+)
+
+all_weeks_type_count = int(
+    (
+        valid_three_weeks
+        & asin_summary[
+            "all_h1_h2_h3_pricing_type_match"
+        ]
+    ).sum()
+)
+
+
+# ============================================================
+# Print results
+# ============================================================
+
+print("\n" + "=" * 110)
+print("PLANNED VS ACTUAL — WEEKLY MATCH SUMMARY")
+print("=" * 110)
+print(
+    weekly_summary.to_string(
+        index=False
+    )
+)
+
+print("\n" + "=" * 110)
+print("ASIN-LEVEL: ALL H1/H2/H3 MUST MATCH")
+print("=" * 110)
+
+print(
+    "Total JIT ASINs:",
+    f"{len(jit_asins):,}",
+)
+
+print(
+    "ASINs with all three actual weeks available:",
+    f"{int(valid_three_weeks.sum()):,}",
+)
+
+print(
+    "\nAll H1/H2/H3 ind_promotion match:",
+    f"{all_weeks_ind_count:,}",
+    f"({all_weeks_ind_count / len(jit_asins):.2%})",
+)
+
+print(
+    "All H1/H2/H3 promotion amount match:",
+    f"{all_weeks_amount_count:,}",
+    f"({all_weeks_amount_count / len(jit_asins):.2%})",
+)
+
+print(
+    "All H1/H2/H3 pricing type match:",
+    f"{all_weeks_type_count:,}",
+    f"({all_weeks_type_count / len(jit_asins):.2%})",
+)
+
+print(
+    "\nSTRICT — all 9 values match:",
+    f"{strict_all_weeks_count:,}",
+    f"({strict_all_weeks_count / len(jit_asins):.2%})",
+)
+
+print(
+    "SEMANTIC — ignore amount/type when both ind=0:",
+    f"{semantic_all_weeks_count:,}",
+    f"({semantic_all_weeks_count / len(jit_asins):.2%})",
+)
+
+
+# ============================================================
+# Save outputs
+# ============================================================
+
+OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+detail_path = (
+    OUTPUT_DIR
+    / "planned_vs_actual_all3_features_detail.csv"
+)
+
+weekly_summary_path = (
+    OUTPUT_DIR
+    / "planned_vs_actual_all3_features_weekly_summary.csv"
+)
+
+asin_summary_path = (
+    OUTPUT_DIR
+    / "planned_vs_actual_all3_features_asin_summary.csv"
+)
+
+comparison.to_csv(
+    detail_path,
+    index=False,
+)
+
+weekly_summary.to_csv(
+    weekly_summary_path,
+    index=False,
+)
+
+asin_summary.to_csv(
+    asin_summary_path,
+    index=False,
+)
+
+print("\n" + "=" * 110)
+print("OUTPUT FILES")
+print("=" * 110)
+print("Detail:", detail_path.resolve())
+print("Weekly summary:", weekly_summary_path.resolve())
+print("ASIN summary:", asin_summary_path.resolve())
+
+
+result = {
+    "detail": comparison,
+    "weekly_summary": weekly_summary,
+    "asin_summary": asin_summary,
+    "strict_all_h1_h2_h3_match_count":
+        strict_all_weeks_count,
+    "semantic_all_h1_h2_h3_match_count":
+        semantic_all_weeks_count,
+}
